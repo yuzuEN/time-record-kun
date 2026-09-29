@@ -48,13 +48,13 @@ def aggregate_by_user(sessions: Iterable, range_start: int, range_end: int, now:
 
 
 def fmt_duration(seconds: int) -> str:
-    if 0 < seconds < 60:
-        return f"{seconds}s"
-    minutes = seconds // 60
+    minutes, s = divmod(seconds, 60)
     h, m = divmod(minutes, 60)
     if h:
-        return f"{h}h{m:02d}m"
-    return f"{m}m"
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 def fmt_date(d: date) -> str:
