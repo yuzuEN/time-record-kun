@@ -182,9 +182,9 @@ async def today_cmd(interaction: discord.Interaction, member: Optional[discord.M
 
 
 @bot.tree.command(name="stats", description="查看最近 N 天每天的統計")
-@app_commands.describe(days="天數（1~31，預設 7）", member="要查詢的成員（預設為自己）")
+@app_commands.describe(days="天數（1~186，預設 7；超過 31 天改為每週一行）", member="要查詢的成員（預設為自己）")
 @app_commands.guild_only()
-async def stats_cmd(interaction: discord.Interaction, days: app_commands.Range[int, 1, 31] = 7, member: Optional[discord.Member] = None):
+async def stats_cmd(interaction: discord.Interaction, days: app_commands.Range[int, 1, 186] = 7, member: Optional[discord.Member] = None):
     target = member or interaction.user
     now = int(time.time())
     today = datetime.now(TZ).date()
@@ -193,18 +193,28 @@ async def stats_cmd(interaction: discord.Interaction, days: app_commands.Range[i
     sessions = bot.db.query_sessions(interaction.guild_id, target.id, start, now)
     by_day = aggregate(sessions, start, now, now, TZ)
 
-    lines = []
+    # 天數太多時一天一行會超過 embed 字數上限，改成以週（週一～週日）為單位
+    weekly = days > 31
+    rows = {}  # 標籤 -> {類別: 秒數}
     grand = {cat: 0 for cat in CATEGORIES}
     for i in range(days):
         d = first_day + timedelta(days=i)
-        day_totals = by_day.get(d, {})
-        parts = []
-        for cat, (emoji, _) in CATEGORIES.items():
-            sec = day_totals.get(cat, 0)
-            grand[cat] += sec
-            if sec:
-                parts.append(f"{emoji} {fmt_duration(sec)}")
-        lines.append(f"`{fmt_date(d)}` " + ("　".join(parts) if parts else "—"))
+        if weekly:
+            week_start = max(d - timedelta(days=d.weekday()), first_day)
+            week_end = min(week_start + timedelta(days=6 - week_start.weekday()), today)
+            label = f"{week_start:%m/%d}~{week_end:%m/%d}"
+        else:
+            label = fmt_date(d)
+        row = rows.setdefault(label, {cat: 0 for cat in CATEGORIES})
+        for cat, sec in by_day.get(d, {}).items():
+            if cat in row:
+                row[cat] += sec
+                grand[cat] += sec
+
+    lines = []
+    for label, row in rows.items():
+        parts = [f"{CATEGORIES[cat][0]} {fmt_duration(sec)}" for cat, sec in row.items() if sec]
+        lines.append(f"`{label}` " + ("　".join(parts) if parts else "—"))
 
     embed = discord.Embed(title=f"📊 最近 {days} 天統計", description="\n".join(lines), color=0xFEE75C)
     embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)

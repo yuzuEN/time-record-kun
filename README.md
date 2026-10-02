@@ -157,7 +157,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot+applicat
 | `/unset channel` | 停止追蹤某頻道（管理員） | `/unset channel:#讀書室` |
 | `/channels` | 列出目前追蹤中的頻道 | `/channels` |
 | `/today [member]` | 今天各類別各待多久 | `/today` |
-| `/stats [days] [member]` | 最近 N 天每天的明細、總計與日平均（預設 7 天，最多 31 天） | `/stats days:14` |
+| `/stats [days] [member]` | 最近 N 天的明細、總計與日平均（預設 7 天，最多 186 天；超過 31 天時改為每週一行） | `/stats days:14` |
 | `/log [date] [member]` | 某天每次進出的時間點（預設今天） | `/log date:2026-09-28` |
 | `/status [member]` | 目前在哪個頻道、已經待了多久 | `/status` |
 | `/leaderboard [category] [days]` | 伺服器排行榜（預設讀書、7 天） | `/leaderboard category:⛏️ Minecraft days:30` |
