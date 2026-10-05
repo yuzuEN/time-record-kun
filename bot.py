@@ -42,7 +42,7 @@ def cat_label(category: str) -> str:
 
 
 def fmt_clock(ts: int) -> str:
-    return datetime.fromtimestamp(ts, TZ).strftime("%H:%M")
+    return datetime.fromtimestamp(ts, TZ).strftime("%H:%M:%S")
 
 
 class TimeRecordBot(commands.Bot):
@@ -148,9 +148,20 @@ class ConfirmDeleteView(discord.ui.View):
     def __init__(self, guild_id: int, target: discord.Member, start: int, end: int):
         super().__init__(timeout=60)
         self.guild_id, self.target, self.start, self.end = guild_id, target, start, end
+        self.interaction: Optional[discord.Interaction] = None  # 送出確認訊息的那次互動，逾時時用來編輯訊息
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.interaction:
+            try:
+                await self.interaction.edit_original_response(content="⌛ 已逾時，沒有刪除任何紀錄。請重新執行 `/delete`。", view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="確認刪除", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
         count = bot.db.delete_range(self.guild_id, self.target.id, self.start, self.end)
         log.info(
             "%s 刪除了 %s 在 %s ~ %s 的紀錄（%d 個時段）",
@@ -160,6 +171,7 @@ class ConfirmDeleteView(discord.ui.View):
 
     @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
         await interaction.response.edit_message(content="已取消，沒有刪除任何紀錄。", view=None)
 
 
@@ -167,8 +179,8 @@ class ConfirmDeleteView(discord.ui.View):
 @app_commands.describe(
     member="要修正紀錄的成員",
     date="開始日期，格式 YYYY-MM-DD",
-    start="開始時間，格式 HH:MM",
-    end="結束時間，格式 HH:MM（比開始時間早則視為隔天）",
+    start="開始時間，格式 HH:MM 或 HH:MM:SS",
+    end="結束時間，格式 HH:MM 或 HH:MM:SS（比開始時間早則視為隔天）",
 )
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
@@ -176,7 +188,7 @@ async def delete_cmd(interaction: discord.Interaction, member: discord.Member, d
     try:
         start_ts, end_ts = parse_range(date, start, end, TZ)
     except ValueError:
-        await interaction.response.send_message("格式錯誤：日期用 `YYYY-MM-DD`，時間用 `HH:MM`，例如 `2026-10-04` `23:00` `08:30`", ephemeral=True)
+        await interaction.response.send_message("格式錯誤，或開始與結束時間相同。日期用 `YYYY-MM-DD`，時間用 `HH:MM` 或 `HH:MM:SS`，例如 `2026-10-04` `21:50:08` `21:51`", ephemeral=True)
         return
 
     now = int(time.time())
@@ -191,11 +203,13 @@ async def delete_cmd(interaction: discord.Interaction, member: discord.Member, d
         await interaction.response.send_message("這段時間沒有任何紀錄", ephemeral=True)
         return
 
-    range_txt = f"{datetime.fromtimestamp(start_ts, TZ):%m/%d %H:%M} → {datetime.fromtimestamp(end_ts, TZ):%m/%d %H:%M}"
+    range_txt = f"{datetime.fromtimestamp(start_ts, TZ):%m/%d %H:%M:%S} → {datetime.fromtimestamp(end_ts, TZ):%m/%d %H:%M:%S}"
+    view = ConfirmDeleteView(interaction.guild_id, member, start_ts, end_ts)
+    view.interaction = interaction
     await interaction.response.send_message(
         f"⚠️ 即將刪除 **{member.display_name}** 在 `{range_txt}` 的紀錄，"
         f"共 **{fmt_duration(removed)}**（{len(sessions)} 個時段）。此動作無法復原，確定嗎？",
-        view=ConfirmDeleteView(interaction.guild_id, member, start_ts, end_ts),
+        view=view,
         ephemeral=True,
     )
 

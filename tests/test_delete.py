@@ -81,6 +81,14 @@ class DeleteRangeTest(unittest.TestCase):
         self.assertEqual(self.db.delete_range(G, U, 100, 200), 0)
         self.assertEqual(self.rows(), [(0, 100), (200, 300)])
 
+    def test_short_session_removed_with_second_precision(self):
+        # 例如 21:50:05 ~ 21:50:57 的 52 秒紀錄，用秒數精確刪除，前後紀錄不受影響
+        self.add(1000, 1005)
+        self.add(1005, 1057)
+        self.add(1057, 1100)
+        self.db.delete_range(G, U, 1005, 1057)
+        self.assertEqual(self.rows(), [(1000, 1005), (1057, 1100)])
+
     def test_other_users_and_guilds_are_untouched(self):
         self.add(100, 400)
         self.add(100, 400, user=U + 1)
@@ -109,9 +117,25 @@ class ParseRangeTest(unittest.TestCase):
             (self.ts(2026, 10, 4, 23, 0), self.ts(2026, 10, 5, 8, 30)),
         )
 
-    def test_equal_times_means_full_day(self):
-        start, end = parse_range("2026-10-04", "00:00", "00:00", self.TZ)
-        self.assertEqual(end - start, 86400)
+    def test_equal_times_raise(self):
+        # 開始等於結束不再被當成一整天，避免誤刪
+        for t in ("21:50", "21:50:00"):
+            with self.assertRaises(ValueError):
+                parse_range("2026-10-04", t, t, self.TZ)
+
+    def test_seconds(self):
+        self.assertEqual(
+            parse_range("2026-10-04", "21:50:08", "21:51", self.TZ),
+            (self.ts(2026, 10, 4, 21, 50, 8), self.ts(2026, 10, 4, 21, 51, 0)),
+        )
+
+    def test_seconds_within_same_minute(self):
+        start, end = parse_range("2026-10-04", "21:50:00", "21:50:59", self.TZ)
+        self.assertEqual(end - start, 59)
+
+    def test_seconds_crossing_midnight(self):
+        _, end = parse_range("2026-10-04", "23:59:30", "00:00:10", self.TZ)
+        self.assertEqual(end, self.ts(2026, 10, 5, 0, 0, 10))
 
     def test_month_rollover(self):
         _, end = parse_range("2026-10-31", "22:00", "01:00", self.TZ)
@@ -119,7 +143,8 @@ class ParseRangeTest(unittest.TestCase):
 
     def test_invalid_formats_raise(self):
         for args in [("2026/10/04", "08:00", "09:00"), ("2026-10-04", "8點", "09:00"),
-                     ("2026-10-04", "08:00", "25:00"), ("2026-02-30", "08:00", "09:00")]:
+                     ("2026-10-04", "08:00", "25:00"), ("2026-02-30", "08:00", "09:00"),
+                     ("2026-10-04", "08:00:60", "09:00"), ("2026-10-04", "08", "09:00")]:
             with self.assertRaises(ValueError):
                 parse_range(*args, self.TZ)
 

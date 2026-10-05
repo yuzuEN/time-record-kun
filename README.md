@@ -94,7 +94,7 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 |---|---|---|
 | `/setup channel category` | 把語音頻道設為某一類（管理員） | `/setup channel:#讀書室 category:📚 讀書` |
 | `/unset channel` | 停止追蹤某頻道（管理員） | `/unset channel:#讀書室` |
-| `/delete member date start end` | 刪除某成員在指定時間段的紀錄，例如忘記退出語音頻道（管理員，會先確認） | `/delete member:@小明 date:2026-10-04 start:23:00 end:08:30` |
+| `/delete member date start end` | 刪除某成員在指定時間段的紀錄，例如忘記退出語音頻道（管理員，會先確認）。時間可用 `HH:MM` 或 `HH:MM:SS`，結束早於開始視為隔天 | `/delete member:@小明 date:2026-10-04 start:23:00 end:08:30` |
 | `/channels` | 列出目前追蹤中的頻道 | `/channels` |
 | `/today [member]` | 今天各類別各待多久 | `/today` |
 | `/stats [days] [member]` | 最近 N 天的明細、總計與日平均（預設 7 天，最多 186 天；超過 31 天時改為每週一行） | `/stats days:14` |
