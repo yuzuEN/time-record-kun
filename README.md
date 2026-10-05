@@ -56,83 +56,22 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 
 ---
 
-## 🚀 安裝與執行
+## 🚀 快速開始
 
-### 需求
+本機器人需要**自行架設**：每個人用自己的 Bot Token 執行，資料存在自己的主機上。
 
-- Python 3.9 以上
-- 一個 Discord Bot（建立方式見下一節）
+1. 到 [Discord Developer Portal](https://discord.com/developers/applications) 建立 Bot、取得 Token，並邀請進伺服器。
+2. 安裝並啟動：
 
-### 步驟
+   ```bash
+   pip install -r requirements.txt
+   cp .env.example .env    # Windows 用 copy；接著在 .env 填入 DISCORD_TOKEN
+   python bot.py
+   ```
 
-```bash
-# 1. 安裝相依套件
-pip install -r requirements.txt
+3. 在 Discord 用 `/setup` 設定要追蹤的語音頻道。
 
-# 2. 建立設定檔
-copy .env.example .env      # Windows
-# cp .env.example .env      # macOS / Linux
-
-# 3. 編輯 .env，至少填入 DISCORD_TOKEN
-
-# 4. 啟動
-python bot.py
-```
-
-### `.env` 設定
-
-| 變數 | 必填 | 說明 |
-|---|---|---|
-| `DISCORD_TOKEN` | ✅ | 機器人的 Token |
-| `TIMEZONE` | | 判斷「一天」的時區，預設 `Asia/Taipei` |
-| `GUILD_ID` | | 填入伺服器 ID 後，斜線指令會**立即**同步到該伺服器（適合測試）。留空則全域同步 |
-| `DB_PATH` | | 資料庫檔案路徑，預設 `timerecord.db` |
-
-> 🔒 `.env` 與 `*.db` 已寫在 `.gitignore` 裡。**請絕對不要把 Token 上傳或分享給別人**，如果外洩，請立刻到 Developer Portal 重設。
-
----
-
-## 🤖 建立機器人與邀請方法
-
-### 1. 建立 Application 與 Bot
-
-1. 前往 [Discord Developer Portal](https://discord.com/developers/applications)，點 **New Application**，取個名字。
-2. 左側選 **Bot**：
-   - 點 **Reset Token** 取得 Token，貼到 `.env` 的 `DISCORD_TOKEN`。
-   - **Privileged Gateway Intents 都不需要開啟**（本機器人只用到預設的 `Guilds` 與 `Guild Voice States`）。
-3. 左側選 **General Information**，複製 **Application ID**（也就是 Client ID）。
-
-### 2. 產生邀請連結
-
-**方法 A：直接修改網址**
-
-把下面的 `YOUR_CLIENT_ID` 換成你的 Application ID，用瀏覽器開啟：
-
-```
-https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot+applications.commands&permissions=52224
-```
-
-**方法 B：用 Developer Portal 產生**
-
-左側選 **OAuth2 → URL Generator**：
-
-- **Scopes**：勾選 `bot`、`applications.commands`
-- **Bot Permissions**：勾選下表的權限
-
-| 權限 | 用途 |
-|---|---|
-| View Channels | 看得到語音頻道，才能收到成員進出的事件 |
-| Send Messages | 回覆指令 |
-| Embed Links | 以嵌入卡片顯示統計 |
-| Attach Files | `/export` 傳送 CSV 檔 |
-
-（以上加總的權限值即為 `52224`。）
-
-### 3. 邀請進伺服器
-
-開啟連結 → 選擇伺服器 → 授權。你必須在該伺服器擁有「管理伺服器」權限才能邀請。
-
-> 如果追蹤的語音頻道是私人頻道，記得在頻道權限裡讓機器人可以「檢視頻道」。
+📘 **完整步驟**（建立 Bot、邀請連結與權限、`.env` 設定、部署到 Railway、設定管理員權限）請看 [docs/setup.md](docs/setup.md)。
 
 ---
 
@@ -155,6 +94,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot+applicat
 |---|---|---|
 | `/setup channel category` | 把語音頻道設為某一類（管理員） | `/setup channel:#讀書室 category:📚 讀書` |
 | `/unset channel` | 停止追蹤某頻道（管理員） | `/unset channel:#讀書室` |
+| `/delete member date start end` | 刪除某成員在指定時間段的紀錄，例如忘記退出語音頻道（管理員，會先確認） | `/delete member:@小明 date:2026-10-04 start:23:00 end:08:30` |
 | `/channels` | 列出目前追蹤中的頻道 | `/channels` |
 | `/today [member]` | 今天各類別各待多久 | `/today` |
 | `/stats [days] [member]` | 最近 N 天的明細、總計與日平均（預設 7 天，最多 186 天；超過 31 天時改為每週一行） | `/stats days:14` |
@@ -199,6 +139,10 @@ discordTimeRecord/
 ├── stats.py          # 跨日切割與統計計算
 ├── requirements.txt  # 相依套件
 ├── .env.example      # 設定檔範本
+├── railway.json      # Railway 部署設定
+├── docs/
+│   └── setup.md      # 架設教學
+├── tests/            # 單元測試（python -m unittest discover tests）
 └── README.md
 ```
 
