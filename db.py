@@ -118,6 +118,29 @@ class Database:
             (guild_id, user_id, user_id, end, start),
         ).fetchall()
 
+    def delete_range(self, guild_id: int, user_id: int, start: int, end: int) -> int:
+        """刪除某使用者在 [start, end) 內的紀錄：區間內的時段刪掉，跨邊界的時段裁切或拆成兩段。回傳受影響的時段數。"""
+        rows = self.query_sessions(guild_id, user_id, start, end)
+        with self.conn:
+            for s in rows:
+                join, leave = s["join_ts"], s["leave_ts"]
+                covers_tail = leave is not None and leave <= end  # 時段結尾落在刪除區間內
+                if join >= start and covers_tail:
+                    self.conn.execute("DELETE FROM sessions WHERE id = ?", (s["id"],))
+                elif join >= start:
+                    self.conn.execute("UPDATE sessions SET join_ts = ? WHERE id = ?", (end, s["id"]))
+                elif covers_tail:
+                    self.conn.execute("UPDATE sessions SET leave_ts = ? WHERE id = ?", (start, s["id"]))
+                else:
+                    # 刪除區間在時段中間：保留前半段，後半段另存一筆
+                    self.conn.execute("UPDATE sessions SET leave_ts = ? WHERE id = ?", (start, s["id"]))
+                    self.conn.execute(
+                        "INSERT INTO sessions (guild_id, user_id, channel_id, category, join_ts, leave_ts) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (guild_id, user_id, s["channel_id"], s["category"], end, leave),
+                    )
+        return len(rows)
+
     # ---------- meta ----------
 
     def get_meta(self, key: str) -> Optional[str]:

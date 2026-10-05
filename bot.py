@@ -14,7 +14,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from db import Database
-from stats import aggregate, aggregate_by_user, day_start_ts, fmt_date, fmt_duration
+from stats import aggregate, aggregate_by_user, day_start_ts, fmt_date, fmt_duration, parse_range
 
 load_dotenv()
 
@@ -142,6 +142,62 @@ async def unset_cmd(interaction: discord.Interaction, channel: discord.VoiceChan
         await interaction.response.send_message(f"🗑️ 已停止追蹤 {channel.mention}")
     else:
         await interaction.response.send_message(f"{channel.mention} 本來就沒有被追蹤", ephemeral=True)
+
+
+class ConfirmDeleteView(discord.ui.View):
+    def __init__(self, guild_id: int, target: discord.Member, start: int, end: int):
+        super().__init__(timeout=60)
+        self.guild_id, self.target, self.start, self.end = guild_id, target, start, end
+
+    @discord.ui.button(label="確認刪除", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        count = bot.db.delete_range(self.guild_id, self.target.id, self.start, self.end)
+        log.info(
+            "%s 刪除了 %s 在 %s ~ %s 的紀錄（%d 個時段）",
+            interaction.user, self.target, self.start, self.end, count,
+        )
+        await interaction.response.edit_message(content=f"🗑️ 已刪除，共影響 {count} 個時段。", view=None)
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="已取消，沒有刪除任何紀錄。", view=None)
+
+
+@bot.tree.command(name="delete", description="刪除某成員在指定時間段的紀錄（例如忘記退出語音頻道）")
+@app_commands.describe(
+    member="要修正紀錄的成員",
+    date="開始日期，格式 YYYY-MM-DD",
+    start="開始時間，格式 HH:MM",
+    end="結束時間，格式 HH:MM（比開始時間早則視為隔天）",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def delete_cmd(interaction: discord.Interaction, member: discord.Member, date: str, start: str, end: str):
+    try:
+        start_ts, end_ts = parse_range(date, start, end, TZ)
+    except ValueError:
+        await interaction.response.send_message("格式錯誤：日期用 `YYYY-MM-DD`，時間用 `HH:MM`，例如 `2026-10-04` `23:00` `08:30`", ephemeral=True)
+        return
+
+    now = int(time.time())
+    end_ts = min(end_ts, now)
+    if start_ts >= end_ts:
+        await interaction.response.send_message("開始時間必須早於現在", ephemeral=True)
+        return
+
+    sessions = bot.db.query_sessions(interaction.guild_id, member.id, start_ts, end_ts)
+    removed = sum(aggregate_by_user(sessions, start_ts, end_ts, now).get(member.id, {}).values())
+    if not removed:
+        await interaction.response.send_message("這段時間沒有任何紀錄", ephemeral=True)
+        return
+
+    range_txt = f"{datetime.fromtimestamp(start_ts, TZ):%m/%d %H:%M} → {datetime.fromtimestamp(end_ts, TZ):%m/%d %H:%M}"
+    await interaction.response.send_message(
+        f"⚠️ 即將刪除 **{member.display_name}** 在 `{range_txt}` 的紀錄，"
+        f"共 **{fmt_duration(removed)}**（{len(sessions)} 個時段）。此動作無法復原，確定嗎？",
+        view=ConfirmDeleteView(interaction.guild_id, member, start_ts, end_ts),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="channels", description="列出目前追蹤中的語音頻道")

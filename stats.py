@@ -15,6 +15,16 @@ def local_date(ts: int, tz: tzinfo) -> date:
     return datetime.fromtimestamp(ts, tz).date()
 
 
+def parse_range(date_str: str, start_str: str, end_str: str, tz: tzinfo) -> Tuple[int, int]:
+    """把 YYYY-MM-DD 與兩個 HH:MM 轉成 timestamp 區間；結束時間不晚於開始時間時視為隔天。格式錯誤會丟出 ValueError。"""
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    t1 = datetime.strptime(start_str, "%H:%M").time()
+    t2 = datetime.strptime(end_str, "%H:%M").time()
+    begin = datetime.combine(d, t1, tzinfo=tz)
+    finish = datetime.combine(d + timedelta(days=1) if t2 <= t1 else d, t2, tzinfo=tz)
+    return int(begin.timestamp()), int(finish.timestamp())
+
+
 def split_by_day(start: int, end: int, tz: tzinfo) -> Iterator[Tuple[date, int]]:
     """把 [start, end) 切成每個本地日期各自的秒數，處理跨午夜的時段。"""
     cur = start
