@@ -115,6 +115,8 @@ python bot.py
 
 > ⚠️ 第 4 步很重要。容器內的檔案在每次重新部署時都會被清掉，沒有掛 Volume 的話，**每次更新程式都會失去所有紀錄**。
 
+> 💡 建議在 Railway 服務的 **Settings** 開啟 **Wait for CI**：push 之後會等 GitHub Actions 的測試通過才部署，測試失敗就不會把有問題的版本上線（見 [6. 執行測試](#6-執行測試)）。
+
 其他平台（VPS、樹莓派、NAS）也可以，只要能長時間執行 `python bot.py` 即可。
 
 ---
@@ -139,8 +141,14 @@ python bot.py
 
 ## 6. 執行測試
 
-測試只用到 Python 內建的 `unittest`，不需要額外安裝套件：
+測試使用 Python 內建的 `unittest`，先照第 3 步安裝 `requirements.txt` 後執行：
 
 ```bash
 python -m unittest discover tests
 ```
+
+測試不會連線到 Discord，也不會建立或修改 `timerecord.db`。
+
+### 自動測試（GitHub Actions）
+
+每次 push 到 `main` 或開 Pull Request 時，GitHub Actions 會自動用 Python 3.9 與 3.12 執行全部測試（設定在 `.github/workflows/test.yml`），結果顯示在 GitHub 的 commit 旁邊與 **Actions** 分頁。
