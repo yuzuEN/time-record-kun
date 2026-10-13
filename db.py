@@ -22,6 +22,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (guild_id, user_id, join_ts);
 CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions (leave_ts);
 
+CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id          INTEGER PRIMARY KEY,
+    privacy           TEXT NOT NULL DEFAULT 'public',  -- public：大家都能查大家；private：只有管理員能查別人
+    report_channel_id INTEGER,                         -- 每日排行榜公告頻道，NULL 表示關閉
+    report_last       TEXT                             -- 最後一次已處理每日排行榜的本地日期（YYYY-MM-DD）
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -140,6 +147,36 @@ class Database:
                         (guild_id, user_id, s["channel_id"], s["category"], end, leave),
                     )
         return len(rows)
+
+    # ---------- 伺服器設定 ----------
+
+    def get_privacy(self, guild_id: int) -> str:
+        row = self.conn.execute("SELECT privacy FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+        return row["privacy"] if row else "public"
+
+    def set_privacy(self, guild_id: int, privacy: str) -> None:
+        self._exec(
+            "INSERT INTO guild_settings (guild_id, privacy) VALUES (?, ?) "
+            "ON CONFLICT (guild_id) DO UPDATE SET privacy = excluded.privacy",
+            (guild_id, privacy),
+        )
+
+    def set_report_channel(self, guild_id: int, channel_id: Optional[int], last: Optional[str] = None) -> None:
+        """設定（或以 None 關閉）每日排行榜頻道；last 是視為已處理過的日期，避免設定後立刻補發。"""
+        self._exec(
+            "INSERT INTO guild_settings (guild_id, report_channel_id, report_last) VALUES (?, ?, ?) "
+            "ON CONFLICT (guild_id) DO UPDATE SET report_channel_id = excluded.report_channel_id, "
+            "report_last = excluded.report_last",
+            (guild_id, channel_id, last),
+        )
+
+    def set_report_last(self, guild_id: int, last: str) -> None:
+        self._exec("UPDATE guild_settings SET report_last = ? WHERE guild_id = ?", (last, guild_id))
+
+    def get_report_settings(self) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT guild_id, report_channel_id, report_last FROM guild_settings WHERE report_channel_id IS NOT NULL"
+        ).fetchall()
 
     # ---------- meta ----------
 

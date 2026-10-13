@@ -59,15 +59,24 @@ def aggregate(sessions: Iterable, range_start: int, range_end: int, now: int, tz
     return result
 
 
-def aggregate_by_user(sessions: Iterable, range_start: int, range_end: int, now: int) -> Dict[int, Dict[str, int]]:
-    """回傳 {user_id: {類別: 秒數}}。"""
+def _aggregate_by(field: str, sessions: Iterable, range_start: int, range_end: int, now: int) -> Dict[int, Dict[str, int]]:
     result: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for s in sessions:
         a = max(s["join_ts"], range_start)
         b = min(s["leave_ts"] if s["leave_ts"] is not None else now, range_end)
         if b > a:
-            result[s["user_id"]][s["category"]] += b - a
+            result[s[field]][s["category"]] += b - a
     return result
+
+
+def aggregate_by_user(sessions: Iterable, range_start: int, range_end: int, now: int) -> Dict[int, Dict[str, int]]:
+    """回傳 {user_id: {類別: 秒數}}。"""
+    return _aggregate_by("user_id", sessions, range_start, range_end, now)
+
+
+def aggregate_by_channel(sessions: Iterable, range_start: int, range_end: int, now: int) -> Dict[int, Dict[str, int]]:
+    """回傳 {channel_id: {類別: 秒數}}；頻道中途改過類別時，同一頻道會有多個類別。"""
+    return _aggregate_by("channel_id", sessions, range_start, range_end, now)
 
 
 def fmt_duration(seconds: int) -> str:

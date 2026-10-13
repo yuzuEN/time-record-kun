@@ -14,7 +14,9 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from db import Database
-from stats import aggregate, aggregate_by_user, day_start_ts, fmt_date, fmt_duration, parse_range
+from stats import (
+    aggregate, aggregate_by_channel, aggregate_by_user, day_start_ts, fmt_date, fmt_duration, parse_range,
+)
 
 load_dotenv()
 
@@ -45,6 +47,39 @@ def fmt_clock(ts: int) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%H:%M:%S")
 
 
+def build_daily_report(db: Database, guild_id: int, day, now: int) -> discord.Embed:
+    """某一天全伺服器的排行榜：依總時數排序，列出每個人每個類別各待多久。"""
+    start = day_start_ts(day, TZ)
+    end = min(day_start_ts(day + timedelta(days=1), TZ), now)
+    by_user = aggregate_by_user(db.query_sessions(guild_id, None, start, end), start, end, now)
+    ranking = sorted(
+        ((uid, totals, sum(totals.values())) for uid, totals in by_user.items()),
+        key=lambda x: x[2],
+        reverse=True,
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, totals, total) in enumerate(ranking):
+        parts = [f"{CATEGORIES[cat][0]} {fmt_duration(totals[cat])}" for cat in CATEGORIES if totals.get(cat)]
+        line = f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}>　**{fmt_duration(total)}**\n　" + "　".join(parts)
+        if sum(len(l) + 1 for l in lines) + len(line) > 3900:
+            lines.append(f"…還有 {len(ranking) - i} 人")
+            break
+        lines.append(line)
+
+    embed = discord.Embed(
+        title=f"🏆 {fmt_date(day)} 每日排行榜",
+        description="\n".join(lines) if lines else "這天沒有任何人進入追蹤中的語音頻道",
+        color=0xF1C40F,
+    )
+    grand = {cat: sum(t.get(cat, 0) for _, t, _ in ranking) for cat in CATEGORIES}
+    for cat in CATEGORIES:
+        embed.add_field(name=cat_label(cat), value=fmt_duration(grand[cat]), inline=True)
+    embed.set_footer(text=f"共 {len(ranking)} 人・時區 {TZ.key}")
+    return embed
+
+
 class TimeRecordBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()  # 已包含 guilds 與 voice_states，不需要特權 intent
@@ -67,6 +102,30 @@ class TimeRecordBot(commands.Bot):
     @tasks.loop(seconds=HEARTBEAT_SECONDS)
     async def heartbeat(self):
         self.db.set_meta("last_alive", str(int(time.time())))
+        if self.is_ready():
+            try:
+                await self.post_daily_reports()
+            except Exception:
+                log.exception("每日排行榜發送失敗")  # 不讓例外中斷心跳
+
+    async def post_daily_reports(self):
+        """過了午夜就把前一天的排行榜貼到設定的頻道。機器人在午夜時離線的話，會在下次啟動時補發。"""
+        today = datetime.now(TZ).date()
+        now = int(time.time())
+        for row in self.db.get_report_settings():
+            if row["report_last"] and row["report_last"] >= today.isoformat():
+                continue
+            # 先標記為已處理，失敗也不每分鐘重試，避免權限錯誤時不斷洗 log
+            self.db.set_report_last(row["guild_id"], today.isoformat())
+            channel = self.get_channel(row["report_channel_id"])
+            if channel is None:
+                log.warning("找不到每日排行榜頻道 %s（伺服器 %s）", row["report_channel_id"], row["guild_id"])
+                continue
+            embed = build_daily_report(self.db, row["guild_id"], today - timedelta(days=1), now)
+            try:
+                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                log.exception("無法在頻道 %s 發送每日排行榜", channel.id)
 
     async def on_ready(self):
         log.info("已登入為 %s (id=%s)", self.user, self.user.id)
@@ -226,13 +285,84 @@ async def channels_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+PRIVACY_LABELS = {
+    "public": "🌐 公開：所有人都能查詢所有人的時間",
+    "private": "🔒 私人：只能查詢自己的時間（管理員可以查詢所有人）",
+}
+
+
+@bot.tree.command(name="privacy", description="設定成員能不能查詢別人的時間（不填則顯示目前設定）")
+@app_commands.describe(mode="查詢權限")
+@app_commands.choices(mode=[app_commands.Choice(name=label, value=key) for key, label in PRIVACY_LABELS.items()])
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def privacy_cmd(interaction: discord.Interaction, mode: Optional[app_commands.Choice[str]] = None):
+    if mode is None:
+        current = bot.db.get_privacy(interaction.guild_id)
+        await interaction.response.send_message(f"目前的查詢權限：{PRIVACY_LABELS[current]}", ephemeral=True)
+        return
+    bot.db.set_privacy(interaction.guild_id, mode.value)
+    await interaction.response.send_message(f"✅ 查詢權限已設定為 {PRIVACY_LABELS[mode.value]}")
+
+
+report_group = app_commands.Group(
+    name="report",
+    description="每天 00:00 自動在指定頻道公告前一天的排行榜",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@report_group.command(name="set", description="設定每日排行榜要公告在哪個文字頻道")
+@app_commands.describe(channel="公告用的文字頻道")
+async def report_set_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        await interaction.response.send_message(
+            f"機器人在 {channel.mention} 沒有「檢視頻道」「發送訊息」「嵌入連結」權限，請先調整頻道權限。", ephemeral=True
+        )
+        return
+    # 今天視為已處理，第一則公告會在今晚 00:00 發出（內容是今天的排行榜）
+    bot.db.set_report_channel(interaction.guild_id, channel.id, datetime.now(TZ).date().isoformat())
+    await interaction.response.send_message(f"✅ 每天 00:00 會在 {channel.mention} 公告前一天的排行榜")
+
+
+@report_group.command(name="off", description="關閉每日排行榜公告")
+async def report_off_cmd(interaction: discord.Interaction):
+    bot.db.set_report_channel(interaction.guild_id, None)
+    await interaction.response.send_message("🔕 已關閉每日排行榜公告")
+
+
+@report_group.command(name="preview", description="預覽今天到目前為止的每日排行榜（只有自己看得到）")
+async def report_preview_cmd(interaction: discord.Interaction):
+    embed = build_daily_report(bot.db, interaction.guild_id, datetime.now(TZ).date(), int(time.time()))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(report_group)
+
+
 # ================= 統計指令 =================
+
+async def ensure_can_view(interaction: discord.Interaction, target: discord.abc.User) -> bool:
+    """依伺服器的查詢權限設定，檢查能不能查詢 target 的紀錄；不行時回覆錯誤訊息。"""
+    if (
+        target.id == interaction.user.id
+        or bot.db.get_privacy(interaction.guild_id) == "public"
+        or interaction.user.guild_permissions.manage_guild
+    ):
+        return True
+    await interaction.response.send_message("🔒 這個伺服器設定為只能查詢自己的紀錄（管理員除外）", ephemeral=True)
+    return False
+
 
 @bot.tree.command(name="today", description="查看今天在各類頻道待了多久")
 @app_commands.describe(member="要查詢的成員（預設為自己）")
 @app_commands.guild_only()
 async def today_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
     target = member or interaction.user
+    if not await ensure_can_view(interaction, target):
+        return
     now = int(time.time())
     today = datetime.now(TZ).date()
     start = day_start_ts(today, TZ)
@@ -256,6 +386,8 @@ async def today_cmd(interaction: discord.Interaction, member: Optional[discord.M
 @app_commands.guild_only()
 async def stats_cmd(interaction: discord.Interaction, days: app_commands.Range[int, 1, 186] = 7, member: Optional[discord.Member] = None):
     target = member or interaction.user
+    if not await ensure_can_view(interaction, target):
+        return
     now = int(time.time())
     today = datetime.now(TZ).date()
     first_day = today - timedelta(days=days - 1)
@@ -303,6 +435,8 @@ async def stats_cmd(interaction: discord.Interaction, days: app_commands.Range[i
 @app_commands.guild_only()
 async def log_cmd(interaction: discord.Interaction, date: Optional[str] = None, member: Optional[discord.Member] = None):
     target = member or interaction.user
+    if not await ensure_can_view(interaction, target):
+        return
     try:
         day = datetime.strptime(date, "%Y-%m-%d").date() if date else datetime.now(TZ).date()
     except ValueError:
@@ -337,11 +471,49 @@ async def log_cmd(interaction: discord.Interaction, date: Optional[str] = None, 
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="channeltime", description="查看某天在每個語音頻道各待了多久")
+@app_commands.describe(date="日期，格式 YYYY-MM-DD（預設今天）", member="要查詢的成員（預設為自己）")
+@app_commands.guild_only()
+async def channeltime_cmd(interaction: discord.Interaction, date: Optional[str] = None, member: Optional[discord.Member] = None):
+    target = member or interaction.user
+    if not await ensure_can_view(interaction, target):
+        return
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date() if date else datetime.now(TZ).date()
+    except ValueError:
+        await interaction.response.send_message("日期格式錯誤，請使用 `YYYY-MM-DD`，例如 `2026-09-29`", ephemeral=True)
+        return
+
+    now = int(time.time())
+    start = day_start_ts(day, TZ)
+    end = min(day_start_ts(day + timedelta(days=1), TZ), now)
+    sessions = bot.db.query_sessions(interaction.guild_id, target.id, start, end)
+    by_channel = aggregate_by_channel(sessions, start, end, now)
+
+    rows = sorted(
+        ((cid, cat, sec) for cid, totals in by_channel.items() for cat, sec in totals.items()),
+        key=lambda x: x[2],
+        reverse=True,
+    )
+    lines = [f"{CATEGORIES.get(cat, ('❔',))[0]} <#{cid}>　**{fmt_duration(sec)}**" for cid, cat, sec in rows]
+    if lines:
+        lines.append(f"\n⏱️ 合計 **{fmt_duration(sum(sec for _, _, sec in rows))}**")
+    embed = discord.Embed(
+        title=f"🎧 {fmt_date(day)} 各頻道時間",
+        description="\n".join(lines) if lines else "這天沒有任何紀錄",
+        color=0x3BA55D,
+    )
+    embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="status", description="查看目前在哪個追蹤頻道、待了多久")
 @app_commands.describe(member="要查詢的成員（預設為自己）")
 @app_commands.guild_only()
 async def status_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
     target = member or interaction.user
+    if not await ensure_can_view(interaction, target):
+        return
     current = bot.db.get_open_session(interaction.guild_id, target.id)
     if current is None:
         await interaction.response.send_message(f"**{target.display_name}** 目前不在任何追蹤中的語音頻道")
@@ -391,6 +563,8 @@ async def leaderboard_cmd(
 @app_commands.guild_only()
 async def export_cmd(interaction: discord.Interaction, days: app_commands.Range[int, 1, 365] = 30, member: Optional[discord.Member] = None):
     target = member or interaction.user
+    if not await ensure_can_view(interaction, target):
+        return
     now = int(time.time())
     start = day_start_ts(datetime.now(TZ).date() - timedelta(days=days - 1), TZ)
     sessions = bot.db.query_sessions(interaction.guild_id, target.id, start, now)

@@ -11,7 +11,10 @@
 - **每日統計**：今天在各類頻道分別待了多久。
 - **多日統計**：最近 N 天每天的明細，以及總計和日平均。
 - **進出紀錄**：查看某一天每一次進出的時間點。
+- **各頻道時間**：查看某一天在每個語音頻道各待了多久。
 - **排行榜**：伺服器成員在某類頻道的時數排名。
+- **每日排行榜公告**：每天 00:00 自動在指定頻道貼出前一天每個人各類別的時數。
+- **查詢權限**：可設定成大家都能查大家，或只能查自己（管理員除外）。
 - **CSV 匯出**：匯出原始紀錄，可以用 Excel 或 Google 試算表做進一步分析。
 - **跨日自動切割**：從 23:00 讀到隔天 01:30，會拆成前一天 1 小時、隔天 1.5 小時。
 - **停機補償**：機器人重新啟動時會自動校正離線期間的進出狀態。
@@ -95,15 +98,39 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 | `/setup channel category` | 把語音頻道設為某一類（管理員） | `/setup channel:#讀書室 category:📚 讀書` |
 | `/unset channel` | 停止追蹤某頻道（管理員） | `/unset channel:#讀書室` |
 | `/delete member date start end` | 刪除某成員在指定時間段的紀錄，例如忘記退出語音頻道（管理員，會先確認）。時間可用 `HH:MM` 或 `HH:MM:SS`，結束早於開始視為隔天 | `/delete member:@小明 date:2026-10-04 start:23:00 end:08:30` |
+| `/privacy [mode]` | 設定能不能查詢別人的時間；不填則顯示目前設定（管理員） | `/privacy mode:🔒 私人` |
+| `/report set channel` | 每天 00:00 在該頻道公告前一天的排行榜（管理員） | `/report set channel:#公告` |
+| `/report off` | 關閉每日排行榜公告（管理員） | `/report off` |
+| `/report preview` | 預覽今天到目前為止的排行榜，只有自己看得到（管理員） | `/report preview` |
 | `/channels` | 列出目前追蹤中的頻道 | `/channels` |
 | `/today [member]` | 今天各類別各待多久 | `/today` |
 | `/stats [days] [member]` | 最近 N 天的明細、總計與日平均（預設 7 天，最多 186 天；超過 31 天時改為每週一行） | `/stats days:14` |
 | `/log [date] [member]` | 某天每次進出的時間點（預設今天） | `/log date:2026-09-28` |
+| `/channeltime [date] [member]` | 某天在每個語音頻道各待多久（預設今天） | `/channeltime date:2026-09-28` |
 | `/status [member]` | 目前在哪個頻道、已經待了多久 | `/status` |
 | `/leaderboard [category] [days]` | 伺服器排行榜（預設讀書、7 天） | `/leaderboard category:⛏️ Minecraft days:30` |
 | `/export [days] [member]` | 匯出 CSV 原始紀錄（只有自己看得到） | `/export days:90` |
 
 `[member]` 可省略，省略時查詢的是自己。
+
+### 查詢權限
+
+管理員可以用 `/privacy` 決定成員能不能查詢別人的時間：
+
+| 模式 | 說明 |
+|---|---|
+| 🌐 公開（預設） | 所有人都能用 `[member]` 查詢任何人 |
+| 🔒 私人 | 一般成員只能查詢自己；擁有「管理伺服器」權限的人可以查詢所有人 |
+
+私人模式會限制 `/today`、`/stats`、`/log`、`/channeltime`、`/status`、`/export` 查詢別人。`/leaderboard` 與每日排行榜公告不受影響；如果也想限制排行榜，可以在「伺服器設定 → 整合」把 `/leaderboard` 只開放給特定身分組（見 [docs/setup.md](docs/setup.md#5-設定管理員權限)）。
+
+### 每日排行榜公告
+
+```
+/report set channel:#公告
+```
+
+設定後，機器人每天 00:00（依 `TIMEZONE`）會在該頻道貼出前一天的排行榜，依總時數排序，並列出每個人在各類別的時數。如果機器人在午夜時剛好離線，會在下次啟動後補發前一天的排行榜。公告不會 @ 到任何人。
 
 ### 輸出範例
 
@@ -117,6 +144,26 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 
 📚 讀書 9h16m15s（日均 3h05m25s）  ☕ 休息 1h35m15s  💼 工作 1h30m00s  ⛏️ Minecraft 2h05m30s
 ⏱️ 合計 14h27m00s
+```
+
+`/channeltime`
+
+```
+🎧 09/29(二) 各頻道時間
+📚 #讀書室　2h36m50s
+☕ #休息區　17m05s
+
+⏱️ 合計 2h53m55s
+```
+
+每日排行榜公告
+
+```
+🏆 09/29(二) 每日排行榜
+🥇 @小明　5h20m15s
+　📚 3h20m15s　☕ 40m00s　⛏️ 1h20m00s
+🥈 @小華　2h10m00s
+　📚 2h10m00s
 ```
 
 `/log`
