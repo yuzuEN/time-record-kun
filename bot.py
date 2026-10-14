@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
 import discord
@@ -45,6 +45,23 @@ def cat_label(category: str) -> str:
 
 def fmt_clock(ts: int) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%H:%M:%S")
+
+
+def local_now() -> datetime:
+    return datetime.now(TZ)
+
+
+def parse_minute(text: str) -> Optional[int]:
+    """把 "HH:MM" 轉成午夜後第幾分鐘；格式不對回傳 None。"""
+    try:
+        t = datetime.strptime(text.strip(), "%H:%M")
+    except ValueError:
+        return None
+    return t.hour * 60 + t.minute
+
+
+def fmt_minute(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
 def build_daily_report(db: Database, guild_id: int, day, now: int) -> discord.Embed:
@@ -109,11 +126,15 @@ class TimeRecordBot(commands.Bot):
                 log.exception("每日排行榜發送失敗")  # 不讓例外中斷心跳
 
     async def post_daily_reports(self):
-        """過了午夜就把前一天的排行榜貼到設定的頻道。機器人在午夜時離線的話，會在下次啟動時補發。"""
-        today = datetime.now(TZ).date()
+        """每天到了設定的時間，就把前一天的排行榜貼到設定的頻道。機器人在那時離線的話，會在下次啟動時補發。"""
+        now_dt = local_now()
+        today = now_dt.date()
+        minute = now_dt.hour * 60 + now_dt.minute
         now = int(time.time())
         for row in self.db.get_report_settings():
             if row["report_last"] and row["report_last"] >= today.isoformat():
+                continue
+            if minute < row["report_time"]:
                 continue
             # 先標記為已處理，失敗也不每分鐘重試，避免權限錯誤時不斷洗 log
             self.db.set_report_last(row["guild_id"], today.isoformat())
@@ -123,7 +144,13 @@ class TimeRecordBot(commands.Bot):
                 continue
             embed = build_daily_report(self.db, row["guild_id"], today - timedelta(days=1), now)
             try:
-                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                if isinstance(channel, discord.ForumChannel):
+                    # 論壇頻道：每天開一篇貼文，大家可以在底下留言
+                    await channel.create_thread(
+                        name=embed.title, embed=embed, allowed_mentions=discord.AllowedMentions.none()
+                    )
+                else:
+                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 log.exception("無法在頻道 %s 發送每日排行榜", channel.id)
 
@@ -307,24 +334,52 @@ async def privacy_cmd(interaction: discord.Interaction, mode: Optional[app_comma
 
 report_group = app_commands.Group(
     name="report",
-    description="每天 00:00 自動在指定頻道公告前一天的排行榜",
+    description="每天在指定時間自動公告前一天的排行榜",
     guild_only=True,
     default_permissions=discord.Permissions(manage_guild=True),
 )
 
 
-@report_group.command(name="set", description="設定每日排行榜要公告在哪個文字頻道")
-@app_commands.describe(channel="公告用的文字頻道")
-async def report_set_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
-    perms = channel.permissions_for(interaction.guild.me)
-    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+@report_group.command(name="set", description="設定每日排行榜要公告在哪個頻道、每天幾點公告")
+@app_commands.rename(at="time")
+@app_commands.describe(
+    channel="公告用的文字、公告或論壇頻道（論壇頻道會每天開一篇新貼文）",
+    at="每天公告的時間，格式 HH:MM（預設 00:00）",
+)
+async def report_set_cmd(
+    interaction: discord.Interaction,
+    channel: Union[discord.TextChannel, discord.ForumChannel],
+    at: str = "00:00",
+):
+    minute = parse_minute(at)
+    if minute is None:
+        await interaction.response.send_message("時間格式錯誤，請用 HH:MM，例如 `08:00` 或 `23:30`。", ephemeral=True)
+        return
+    is_forum = isinstance(channel, discord.ForumChannel)
+    if is_forum and channel.is_media():
+        await interaction.response.send_message("不支援媒體頻道，請改用文字、公告或論壇頻道。", ephemeral=True)
+        return
+    if is_forum and channel.flags.require_tag:
         await interaction.response.send_message(
-            f"機器人在 {channel.mention} 沒有「檢視頻道」「發送訊息」「嵌入連結」權限，請先調整頻道權限。", ephemeral=True
+            f"{channel.mention} 要求發文必須選標籤，機器人無法發文，請先在頻道設定關閉「發文時需要標籤」。", ephemeral=True
         )
         return
-    # 今天視為已處理，第一則公告會在今晚 00:00 發出（內容是今天的排行榜）
-    bot.db.set_report_channel(interaction.guild_id, channel.id, datetime.now(TZ).date().isoformat())
-    await interaction.response.send_message(f"✅ 每天 00:00 會在 {channel.mention} 公告前一天的排行榜")
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        action = "發佈貼文" if is_forum else "發送訊息"
+        await interaction.response.send_message(
+            f"機器人在 {channel.mention} 沒有「檢視頻道」「{action}」「嵌入連結」權限，請先調整頻道權限。", ephemeral=True
+        )
+        return
+    # 今天的公告時間還沒到就從今天開始公告，已經過了就從明天開始，避免設定後立刻補發
+    now_dt = local_now()
+    started = now_dt.hour * 60 + now_dt.minute >= minute
+    last = now_dt.date() if started else now_dt.date() - timedelta(days=1)
+    bot.db.set_report_channel(interaction.guild_id, channel.id, last.isoformat(), minute)
+    first = "明天" if started else "今天"
+    await interaction.response.send_message(
+        f"✅ 每天 {fmt_minute(minute)} 會在 {channel.mention} 公告前一天的排行榜（第一次是{first} {fmt_minute(minute)}）"
+    )
 
 
 @report_group.command(name="off", description="關閉每日排行榜公告")

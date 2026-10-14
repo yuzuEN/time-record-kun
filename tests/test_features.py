@@ -97,7 +97,7 @@ class GuildSettingsDbTest(unittest.TestCase):
         self.assertEqual(self.db.get_report_settings(), [])
         self.db.set_report_channel(G, 555, "2026-10-13")
         rows = [tuple(r) for r in self.db.get_report_settings()]
-        self.assertEqual(rows, [(G, 555, "2026-10-13")])
+        self.assertEqual(rows, [(G, 555, "2026-10-13", 0)])
         self.db.set_report_channel(G, None)
         self.assertEqual(self.db.get_report_settings(), [])
 
@@ -111,6 +111,27 @@ class GuildSettingsDbTest(unittest.TestCase):
         self.db.set_report_channel(G, 555, "2026-10-13")
         self.db.set_privacy(G, "private")
         self.assertEqual(self.db.get_report_settings()[0]["report_channel_id"], 555)
+
+    def test_report_time_defaults_to_midnight_and_is_stored(self):
+        self.db.set_report_channel(G, 555, "2026-10-13")
+        self.assertEqual(self.db.get_report_settings()[0]["report_time"], 0)
+        self.db.set_report_channel(G, 555, "2026-10-13", 8 * 60 + 30)
+        self.assertEqual(self.db.get_report_settings()[0]["report_time"], 510)
+
+    def test_migrates_old_schema(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "old.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, privacy TEXT NOT NULL DEFAULT 'public', "
+                "report_channel_id INTEGER, report_last TEXT)"
+            )
+            conn.execute("INSERT INTO guild_settings VALUES (1, 'public', 555, '2026-10-13')")
+            conn.commit()
+            conn.close()
+            db = Database(path)
+            self.assertEqual(db.get_report_settings()[0]["report_time"], 0)
+            db.conn.close()
 
     def test_set_report_last(self):
         self.db.set_report_channel(G, 555, "2026-10-13")
@@ -142,6 +163,13 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.today = datetime.now(bot.TZ).date()
         self.yesterday = self.today - timedelta(days=1)
         self.y0 = day_start_ts(self.yesterday, bot.TZ)  # 昨天 00:00
+
+    def at(self, hour, minute=0):
+        """把「現在」的當地時間固定在今天的 hour:minute。"""
+        dt = datetime.combine(self.today, datetime.min.time(), bot.TZ).replace(hour=hour, minute=minute)
+        p = patch.object(bot, "local_now", return_value=dt)
+        p.start()
+        self.addCleanup(p.stop)
 
 
 class EnsureCanViewTest(BotTestCase):
@@ -336,6 +364,40 @@ class PostDailyReportsTest(BotTestCase):
     def last(self):
         return self.db.get_report_settings()[0]["report_last"]
 
+    async def test_waits_until_configured_time(self):
+        self.db.set_report_channel(G, 555, self.yesterday.isoformat(), 8 * 60 + 30)
+        self.at(8, 29)
+        await bot.bot.post_daily_reports()
+        self.channel.send.assert_not_called()
+        self.assertEqual(self.last(), self.yesterday.isoformat())
+
+    async def test_posts_at_configured_time(self):
+        self.db.set_report_channel(G, 555, self.yesterday.isoformat(), 8 * 60 + 30)
+        self.at(8, 30)
+        await bot.bot.post_daily_reports()
+        self.channel.send.assert_called_once()
+        self.assertIn(f"{self.yesterday:%m/%d}", self.channel.send.call_args.kwargs["embed"].title)
+        self.assertEqual(self.last(), self.today.isoformat())
+
+    async def test_catches_up_later_same_day(self):
+        self.db.set_report_channel(G, 555, self.yesterday.isoformat(), 8 * 60)
+        self.at(15)
+        await bot.bot.post_daily_reports()
+        self.channel.send.assert_called_once()
+
+    async def test_forum_channel_creates_post(self):
+        forum = MagicMock(spec=discord.ForumChannel)
+        forum.id = 555
+        forum.create_thread = AsyncMock()
+        self.get_channel.return_value = forum
+        self.db.set_report_channel(G, 555, self.yesterday.isoformat())
+        await bot.bot.post_daily_reports()
+        forum.create_thread.assert_awaited_once()
+        kwargs = forum.create_thread.call_args.kwargs
+        self.assertEqual(kwargs["name"], kwargs["embed"].title)
+        self.assertIn(f"{self.yesterday:%m/%d}", kwargs["name"])
+        self.assertFalse(kwargs["allowed_mentions"].users)
+
     async def test_posts_yesterday_once(self):
         add(self.db, ME, CH_STUDY, "study", self.y0, self.y0 + 60)
         self.db.set_report_channel(G, 555, self.yesterday.isoformat())
@@ -429,13 +491,59 @@ class AdminCommandsTest(BotTestCase):
         ch.permissions_for.return_value = perms
         return ch
 
+    def forum_with_perms(self, require_tag=False, media=False):
+        ch = MagicMock(spec=discord.ForumChannel)
+        ch.id = 555
+        ch.mention = "<#555>"
+        ch.is_media.return_value = media
+        ch.flags.require_tag = require_tag
+        ch.permissions_for.return_value = MagicMock(view_channel=True, send_messages=True, embed_links=True)
+        return ch
+
     async def test_report_set(self):
         it = make_interaction(make_member(ME, admin=True))
         await bot.report_set_cmd.callback(it, channel=self.channel_with_perms())
         rows = self.db.get_report_settings()
         self.assertEqual(rows[0]["report_channel_id"], 555)
-        # 今天視為已處理，所以不會在設定後立刻補發昨天的排行榜
+        self.assertEqual(rows[0]["report_time"], 0)
+        # 今天的 00:00 已經過了，視為已處理，所以不會在設定後立刻補發昨天的排行榜
         self.assertEqual(rows[0]["report_last"], self.today.isoformat())
+
+    async def test_report_set_time_later_today_starts_today(self):
+        self.at(7, 0)
+        it = make_interaction(make_member(ME, admin=True))
+        await bot.report_set_cmd.callback(it, channel=self.channel_with_perms(), at="8:30")
+        row = self.db.get_report_settings()[0]
+        self.assertEqual(row["report_time"], 510)
+        self.assertEqual(row["report_last"], self.yesterday.isoformat())
+        self.assertIn("08:30", sent(it)[0])
+        self.assertIn("今天", sent(it)[0])
+
+    async def test_report_set_time_already_passed_starts_tomorrow(self):
+        self.at(9, 0)
+        it = make_interaction(make_member(ME, admin=True))
+        await bot.report_set_cmd.callback(it, channel=self.channel_with_perms(), at="08:30")
+        self.assertEqual(self.db.get_report_settings()[0]["report_last"], self.today.isoformat())
+        self.assertIn("明天", sent(it)[0])
+
+    async def test_report_set_rejects_bad_time(self):
+        for bad in ["24:00", "8", "abc", "12:60"]:
+            it = make_interaction(make_member(ME, admin=True))
+            await bot.report_set_cmd.callback(it, channel=self.channel_with_perms(), at=bad)
+            self.assertTrue(sent(it)[1]["ephemeral"], bad)
+        self.assertEqual(self.db.get_report_settings(), [])
+
+    async def test_report_set_forum(self):
+        it = make_interaction(make_member(ME, admin=True))
+        await bot.report_set_cmd.callback(it, channel=self.forum_with_perms())
+        self.assertEqual(self.db.get_report_settings()[0]["report_channel_id"], 555)
+
+    async def test_report_set_rejects_forum_requiring_tags_and_media(self):
+        for ch in [self.forum_with_perms(require_tag=True), self.forum_with_perms(media=True)]:
+            it = make_interaction(make_member(ME, admin=True))
+            await bot.report_set_cmd.callback(it, channel=ch)
+            self.assertTrue(sent(it)[1]["ephemeral"])
+        self.assertEqual(self.db.get_report_settings(), [])
 
     async def test_report_set_requires_bot_permissions(self):
         it = make_interaction(make_member(ME, admin=True))
@@ -466,6 +574,13 @@ class CommandRegistrationTest(unittest.TestCase):
             self.assertIsNotNone(tree.get_command(name), name)
         report = tree.get_command("report")
         self.assertEqual(sorted(c.name for c in report.commands), ["off", "preview", "set"])
+        params = {p.display_name: p for p in report.get_command("set").parameters}
+        self.assertEqual(sorted(params), ["channel", "time"])
+        self.assertFalse(params["time"].required)
+        self.assertEqual(
+            set(params["channel"].channel_types),
+            {discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.forum, discord.ChannelType.media},
+        )
 
     def test_admin_commands_need_manage_guild(self):
         for name in ["privacy", "report"]:

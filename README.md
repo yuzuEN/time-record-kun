@@ -99,7 +99,7 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 | `/unset channel` | 停止追蹤某頻道（管理員） | `/unset channel:#讀書室` |
 | `/delete member date start end` | 刪除某成員在指定時間段的紀錄，例如忘記退出語音頻道（管理員，會先確認）。時間可用 `HH:MM` 或 `HH:MM:SS`，結束早於開始視為隔天 | `/delete member:@小明 date:2026-10-04 start:23:00 end:08:30` |
 | `/privacy [mode]` | 設定能不能查詢別人的時間；不填則顯示目前設定（管理員） | `/privacy mode:🔒 私人` |
-| `/report set channel` | 每天 00:00 在該頻道公告前一天的排行榜（管理員） | `/report set channel:#公告` |
+| `/report set channel [time]` | 每天在指定時間（預設 00:00）於該頻道公告前一天的排行榜；可選文字、公告或論壇頻道（管理員） | `/report set channel:#公告 time:08:00` |
 | `/report off` | 關閉每日排行榜公告（管理員） | `/report off` |
 | `/report preview` | 預覽今天到目前為止的排行榜，只有自己看得到（管理員） | `/report preview` |
 | `/channels` | 列出目前追蹤中的頻道 | `/channels` |
@@ -127,10 +127,18 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 ### 每日排行榜公告
 
 ```
-/report set channel:#公告
+/report set channel:#公告 time:08:00
 ```
 
-設定後，機器人每天 00:00（依 `TIMEZONE`）會在該頻道貼出前一天的排行榜，依總時數排序，並列出每個人在各類別的時數。如果機器人在午夜時剛好離線，會在下次啟動後補發前一天的排行榜。公告不會 @ 到任何人。
+設定後，機器人每天在 `time`（依 `TIMEZONE`，格式 `HH:MM`，不填則為 00:00）會在該頻道貼出前一天的排行榜，依總時數排序，並列出每個人在各類別的時數。如果機器人在公告時間剛好離線，會在當天稍後啟動時補發。公告不會 @ 到任何人。
+
+頻道可以選：
+
+- **文字頻道**：直接發一則訊息。
+- **公告頻道**：同上，其他伺服器也可以「追蹤」這個頻道。
+- **論壇頻道**：每天開一篇標題為「🏆 MM/DD 每日排行榜」的新貼文，成員可以在每天的貼文底下留言。如果論壇開啟了「發文時需要標籤」，請先關閉。
+
+想改公告時間或頻道，再執行一次 `/report set` 即可。
 
 ### 輸出範例
 

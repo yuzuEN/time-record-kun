@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id          INTEGER PRIMARY KEY,
     privacy           TEXT NOT NULL DEFAULT 'public',  -- public：大家都能查大家；private：只有管理員能查別人
     report_channel_id INTEGER,                         -- 每日排行榜公告頻道，NULL 表示關閉
+    report_time       INTEGER NOT NULL DEFAULT 0,      -- 每日排行榜公告時間，當地時間午夜後第幾分鐘
     report_last       TEXT                             -- 最後一次已處理每日排行榜的本地日期（YYYY-MM-DD）
 );
 
@@ -41,7 +42,14 @@ class Database:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """替舊版資料庫補上後來新增的欄位。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(guild_settings)")}
+        if "report_time" not in cols:
+            self.conn.execute("ALTER TABLE guild_settings ADD COLUMN report_time INTEGER NOT NULL DEFAULT 0")
 
     def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         cur = self.conn.execute(sql, params)
@@ -161,13 +169,16 @@ class Database:
             (guild_id, privacy),
         )
 
-    def set_report_channel(self, guild_id: int, channel_id: Optional[int], last: Optional[str] = None) -> None:
-        """設定（或以 None 關閉）每日排行榜頻道；last 是視為已處理過的日期，避免設定後立刻補發。"""
+    def set_report_channel(
+        self, guild_id: int, channel_id: Optional[int], last: Optional[str] = None, minute: int = 0
+    ) -> None:
+        """設定（或以 None 關閉）每日排行榜頻道；last 是視為已處理過的日期，避免設定後立刻補發；
+        minute 是每天公告的時間（午夜後第幾分鐘）。"""
         self._exec(
-            "INSERT INTO guild_settings (guild_id, report_channel_id, report_last) VALUES (?, ?, ?) "
+            "INSERT INTO guild_settings (guild_id, report_channel_id, report_last, report_time) VALUES (?, ?, ?, ?) "
             "ON CONFLICT (guild_id) DO UPDATE SET report_channel_id = excluded.report_channel_id, "
-            "report_last = excluded.report_last",
-            (guild_id, channel_id, last),
+            "report_last = excluded.report_last, report_time = excluded.report_time",
+            (guild_id, channel_id, last, minute),
         )
 
     def set_report_last(self, guild_id: int, last: str) -> None:
@@ -175,7 +186,8 @@ class Database:
 
     def get_report_settings(self) -> List[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT guild_id, report_channel_id, report_last FROM guild_settings WHERE report_channel_id IS NOT NULL"
+            "SELECT guild_id, report_channel_id, report_last, report_time FROM guild_settings "
+            "WHERE report_channel_id IS NOT NULL"
         ).fetchall()
 
     # ---------- meta ----------
