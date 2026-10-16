@@ -100,6 +100,14 @@ def build_daily_report(db: Database, guild_id: int, day, now: int) -> discord.Em
     return embed
 
 
+async def send_report(channel, embed: discord.Embed) -> None:
+    if isinstance(channel, discord.ForumChannel):
+        # 論壇頻道：每天開一篇貼文，大家可以在底下留言
+        await channel.create_thread(name=embed.title, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
 class TimeRecordBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()  # 已包含 guilds 與 voice_states，不需要特權 intent
@@ -147,13 +155,7 @@ class TimeRecordBot(commands.Bot):
                 continue
             embed = build_daily_report(self.db, row["guild_id"], today - timedelta(days=1), now)
             try:
-                if isinstance(channel, discord.ForumChannel):
-                    # 論壇頻道：每天開一篇貼文，大家可以在底下留言
-                    await channel.create_thread(
-                        name=embed.title, embed=embed, allowed_mentions=discord.AllowedMentions.none()
-                    )
-                else:
-                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                await send_report(channel, embed)
             except discord.HTTPException:
                 log.exception("無法在頻道 %s 發送每日排行榜", channel.id)
 
@@ -391,10 +393,48 @@ async def report_off_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("🔕 已關閉每日排行榜公告")
 
 
-@report_group.command(name="preview", description="預覽今天到目前為止的每日排行榜（只有自己看得到）")
-async def report_preview_cmd(interaction: discord.Interaction):
-    embed = build_daily_report(bot.db, interaction.guild_id, datetime.now(TZ).date(), int(time.time()))
+@report_group.command(name="preview", description="預覽某天的每日排行榜，預設今天到目前為止（只有自己看得到）")
+@app_commands.describe(date="日期，格式 YYYY-MM-DD，預設今天")
+async def report_preview_cmd(interaction: discord.Interaction, date: Optional[str] = None):
+    today = local_now().date()
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date() if date else today
+    except ValueError:
+        await interaction.response.send_message("日期格式錯誤，請使用 `YYYY-MM-DD`，例如 `2026-09-29`", ephemeral=True)
+        return
+    if day > today:
+        await interaction.response.send_message("不能預覽未來的日期。", ephemeral=True)
+        return
+    embed = build_daily_report(bot.db, interaction.guild_id, day, int(time.time()))
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@report_group.command(name="post", description="手動在公告頻道發佈某天的每日排行榜，例如補發或重發")
+@app_commands.describe(date="日期，格式 YYYY-MM-DD，必須是今天以前")
+async def report_post_cmd(interaction: discord.Interaction, date: str):
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        await interaction.response.send_message("日期格式錯誤，請使用 `YYYY-MM-DD`，例如 `2026-09-29`", ephemeral=True)
+        return
+    if day >= local_now().date():
+        await interaction.response.send_message(
+            "只能發佈已經結束的日子；想看今天到目前為止的排行榜，請用 `/report preview`。", ephemeral=True
+        )
+        return
+    channel_id = bot.db.get_report_channel(interaction.guild_id)
+    channel = bot.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        await interaction.response.send_message("還沒設定公告頻道，或頻道已不存在，請先用 `/report set` 設定。", ephemeral=True)
+        return
+    embed = build_daily_report(bot.db, interaction.guild_id, day, int(time.time()))
+    try:
+        await send_report(channel, embed)
+    except discord.HTTPException:
+        log.exception("無法在頻道 %s 發送每日排行榜", channel.id)
+        await interaction.response.send_message(f"無法在 {channel.mention} 發佈，請檢查機器人的頻道權限。", ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ 已在 {channel.mention} 發佈 {fmt_date(day)} 的排行榜", ephemeral=True)
 
 
 bot.tree.add_command(report_group)

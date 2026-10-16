@@ -101,7 +101,8 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 | `/privacy [mode]` | 設定能不能查詢別人的時間；不填則顯示目前設定（管理員） | `/privacy mode:🔒 私人` |
 | `/report set channel [time]` | 每天在指定時間（預設 00:00）於該頻道公告前一天的排行榜；可選文字、公告或論壇頻道（管理員） | `/report set channel:#公告 time:08:00` |
 | `/report off` | 關閉每日排行榜公告（管理員） | `/report off` |
-| `/report preview` | 預覽今天到目前為止的排行榜，只有自己看得到（管理員） | `/report preview` |
+| `/report preview [date]` | 預覽某天的排行榜（預設今天到目前為止），只有自己看得到（管理員） | `/report preview date:2026-10-14` |
+| `/report post date` | 手動在公告頻道發佈某天（今天以前）的排行榜，用來補發或重發（管理員） | `/report post date:2026-10-14` |
 | `/channels` | 列出目前追蹤中的頻道 | `/channels` |
 | `/today [member]` | 今天各類別各待多久 | `/today` |
 | `/stats [days] [member]` | 最近 N 天的明細、總計與日平均（預設 7 天，最多 186 天；超過 31 天時改為每週一行） | `/stats days:14` |
@@ -139,6 +140,8 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 - **論壇頻道**：每天開一篇標題為「🏆 MM/DD 每日排行榜」的新貼文，成員可以在每天的貼文底下留言。如果論壇開啟了「發文時需要標籤」，請先關閉。
 
 想改公告時間或頻道，再執行一次 `/report set` 即可。
+
+如果某天的公告漏發或內容有誤，可以先用 `/report preview date:YYYY-MM-DD` 確認內容，再用 `/report post date:YYYY-MM-DD` 重新發佈到公告頻道（論壇頻道會開一篇新貼文）。舊的公告不會被自動刪除，需要的話請手動刪掉。手動發佈不會影響每天的自動公告。
 
 ### 輸出範例
 

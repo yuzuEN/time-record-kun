@@ -184,6 +184,12 @@ class Database:
     def set_report_last(self, guild_id: int, last: str) -> None:
         self._exec("UPDATE guild_settings SET report_last = ? WHERE guild_id = ?", (last, guild_id))
 
+    def get_report_channel(self, guild_id: int) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT report_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+        return row["report_channel_id"] if row else None
+
     def get_report_settings(self) -> List[sqlite3.Row]:
         return self.conn.execute(
             "SELECT guild_id, report_channel_id, report_last, report_time FROM guild_settings "

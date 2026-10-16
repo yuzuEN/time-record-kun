@@ -586,6 +586,87 @@ class AdminCommandsTest(BotTestCase):
         self.assertIn(f"{self.today:%m/%d}", kwargs["embed"].title)
         self.assertIn(f"<@{ME}>", kwargs["embed"].description)
 
+    async def test_report_preview_past_date(self):
+        add(self.db, ME, CH_STUDY, "study", self.y0, self.y0 + 60)
+        it = make_interaction(make_member(ME, admin=True))
+        await bot.report_preview_cmd.callback(it, date=self.yesterday.isoformat())
+        kwargs = sent(it)[1]
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertIn(f"{self.yesterday:%m/%d}", kwargs["embed"].title)
+        self.assertIn(f"<@{ME}>", kwargs["embed"].description)
+
+    async def test_report_preview_rejects_bad_and_future_dates(self):
+        for bad in ["2026/10/14", (self.today + timedelta(days=1)).isoformat()]:
+            it = make_interaction(make_member(ME, admin=True))
+            await bot.report_preview_cmd.callback(it, date=bad)
+            content, kwargs = sent(it)
+            self.assertTrue(kwargs["ephemeral"], bad)
+            self.assertNotIn("embed", kwargs, bad)
+
+    def patch_report_channel(self, channel):
+        p = patch.object(bot.bot, "get_channel", return_value=channel)
+        p.start()
+        self.addCleanup(p.stop)
+
+    async def test_report_post_past_date(self):
+        add(self.db, ME, CH_STUDY, "study", self.y0, self.y0 + 60)
+        self.db.set_report_channel(G, 555, self.today.isoformat())
+        ch = self.channel_with_perms()
+        ch.send = AsyncMock()
+        self.patch_report_channel(ch)
+        it = make_interaction(make_member(ME, admin=True))
+        await bot.report_post_cmd.callback(it, date=self.yesterday.isoformat())
+        ch.send.assert_awaited_once()
+        kwargs = ch.send.call_args.kwargs
+        self.assertIn(f"{self.yesterday:%m/%d}", kwargs["embed"].title)
+        self.assertIn(f"<@{ME}>", kwargs["embed"].description)
+        self.assertFalse(kwargs["allowed_mentions"].users)
+        self.assertTrue(sent(it)[1]["ephemeral"])
+        # 手動發佈不影響每日自動公告的進度
+        self.assertEqual(self.db.get_report_settings()[0]["report_last"], self.today.isoformat())
+
+    async def test_report_post_to_forum(self):
+        self.db.set_report_channel(G, 555, self.today.isoformat())
+        forum = self.forum_with_perms()
+        forum.create_thread = AsyncMock()
+        self.patch_report_channel(forum)
+        it = make_interaction(make_member(ME, admin=True))
+        await bot.report_post_cmd.callback(it, date=self.yesterday.isoformat())
+        forum.create_thread.assert_awaited_once()
+
+    async def test_report_post_rejects_today_future_and_bad_date(self):
+        self.db.set_report_channel(G, 555, self.today.isoformat())
+        ch = self.channel_with_perms()
+        ch.send = AsyncMock()
+        self.patch_report_channel(ch)
+        for bad in [self.today.isoformat(), (self.today + timedelta(days=3)).isoformat(), "abc"]:
+            it = make_interaction(make_member(ME, admin=True))
+            await bot.report_post_cmd.callback(it, date=bad)
+            self.assertTrue(sent(it)[1]["ephemeral"], bad)
+        ch.send.assert_not_called()
+
+    async def test_report_post_requires_report_channel(self):
+        self.patch_report_channel(None)
+        for setup in [lambda: None, lambda: self.db.set_report_channel(G, 555, self.today.isoformat())]:
+            setup()  # 先是完全沒設定，再來是設定了但頻道已不存在
+            it = make_interaction(make_member(ME, admin=True))
+            await bot.report_post_cmd.callback(it, date=self.yesterday.isoformat())
+            content, kwargs = sent(it)
+            self.assertTrue(kwargs["ephemeral"])
+            self.assertIn("/report set", content)
+
+    async def test_report_post_send_failure(self):
+        self.db.set_report_channel(G, 555, self.today.isoformat())
+        ch = self.channel_with_perms()
+        ch.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(status=403), "no perms"))
+        self.patch_report_channel(ch)
+        it = make_interaction(make_member(ME, admin=True))
+        with self.assertLogs("timerecord", "ERROR"):
+            await bot.report_post_cmd.callback(it, date=self.yesterday.isoformat())
+        content, kwargs = sent(it)
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertIn("權限", content)
+
 
 class CommandRegistrationTest(unittest.TestCase):
     def test_new_commands_registered(self):
@@ -593,7 +674,7 @@ class CommandRegistrationTest(unittest.TestCase):
         for name in ["channeltime", "privacy", "report"]:
             self.assertIsNotNone(tree.get_command(name), name)
         report = tree.get_command("report")
-        self.assertEqual(sorted(c.name for c in report.commands), ["off", "preview", "set"])
+        self.assertEqual(sorted(c.name for c in report.commands), ["off", "post", "preview", "set"])
         params = {p.display_name: p for p in report.get_command("set").parameters}
         self.assertEqual(sorted(params), ["channel", "time"])
         self.assertFalse(params["time"].required)
