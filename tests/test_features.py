@@ -295,23 +295,43 @@ class DailyReportTest(BotTestCase):
 
     def test_sorted_by_total_with_categories(self):
         add(self.db, ME, CH_STUDY, "study", self.y0, self.y0 + 3600)          # 1h
-        add(self.db, ME, CH_REST, "rest", self.y0 + 3600, self.y0 + 4200)     # 10m
+        add(self.db, ME, CH_REST, "work", self.y0 + 3600, self.y0 + 4200)     # 10m
         add(self.db, OTHER, CH_STUDY, "study", self.y0, self.y0 + 7200)       # 2h
         lines = self.report().description.split("\n")
         self.assertEqual(lines, [
             f"🥇 <@{OTHER}>　**2h00m00s**",
             "　📚 2h00m00s",
             f"🥈 <@{ME}>　**1h10m00s**",
-            "　📚 1h00m00s　☕ 10m00s",
+            "　📚 1h00m00s　💼 10m00s",
         ])
+
+    def test_rest_and_minecraft_are_not_counted(self):
+        add(self.db, ME, CH_STUDY, "study", self.y0, self.y0 + 3600)                 # 1h
+        add(self.db, ME, CH_REST, "rest", self.y0 + 3600, self.y0 + 3 * 3600)        # 2h 休息
+        add(self.db, OTHER, CH_STUDY, "study", self.y0, self.y0 + 1800)              # 30m
+        add(self.db, OTHER, CH_STUDY2, "minecraft", self.y0 + 1800, self.y0 + 9000)  # 2h Minecraft
+        add(self.db, OTHER + 1, CH_REST, "rest", self.y0, self.y0 + 9000)            # 只有休息
+        lines = self.report().description.split("\n")
+        self.assertEqual(lines, [
+            f"🥇 <@{ME}>　**1h00m00s**",
+            "　📚 1h00m00s",
+            f"🥈 <@{OTHER}>　**30m00s**",
+            "　📚 30m00s",
+        ])
+
+    def test_only_rest_shows_empty_message(self):
+        add(self.db, ME, CH_REST, "rest", self.y0, self.y0 + 3600)
+        embed = self.report()
+        self.assertEqual(embed.description, "這天沒有任何人進入讀書或工作頻道")
+        self.assertIn("共 0 人", embed.footer.text)
 
     def test_category_totals_and_footer(self):
         add(self.db, ME, CH_STUDY, "study", self.y0, self.y0 + 3600)
         add(self.db, OTHER, CH_STUDY, "study", self.y0, self.y0 + 60)
+        add(self.db, OTHER, CH_REST, "rest", self.y0 + 60, self.y0 + 120)
         embed = self.report()
         fields = {f.name: f.value for f in embed.fields}
-        self.assertEqual(fields["📚 讀書"], "1h01m00s")
-        self.assertEqual(fields["☕ 休息"], "0s")
+        self.assertEqual(fields, {"📚 讀書": "1h01m00s", "💼 工作": "0s"})
         self.assertIn("共 2 人", embed.footer.text)
 
     def test_only_counts_that_day(self):
@@ -325,7 +345,7 @@ class DailyReportTest(BotTestCase):
     def test_other_guild_excluded(self):
         self.db.open_session(G + 1, ME, CH_STUDY, "study", self.y0)
         self.db.close_user_sessions(G + 1, ME, self.y0 + 60)
-        self.assertEqual(self.report().description, "這天沒有任何人進入追蹤中的語音頻道")
+        self.assertEqual(self.report().description, "這天沒有任何人進入讀書或工作頻道")
 
     def test_open_session_counts_until_now(self):
         add(self.db, ME, CH_STUDY, "study", self.y0, None)

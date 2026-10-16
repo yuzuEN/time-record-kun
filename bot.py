@@ -33,7 +33,9 @@ CATEGORIES = {
     "work": ("💼", "工作"),
     "minecraft": ("⛏️", "Minecraft"),
 }
-CATEGORY_CHOICES = [app_commands.Choice(name=f"{e} {n}", value=k) for k, (e, n) in CATEGORIES.items()]
+# 每日排行榜只計算這些類別的時數
+REPORT_CATEGORIES = ("study", "work")
+CATEGORY_CHOICES =[app_commands.Choice(name=f"{e} {n}", value=k) for k, (e, n) in CATEGORIES.items()]
 
 log = logging.getLogger("timerecord")
 
@@ -65,12 +67,13 @@ def fmt_minute(minute: int) -> str:
 
 
 def build_daily_report(db: Database, guild_id: int, day, now: int) -> discord.Embed:
-    """某一天全伺服器的排行榜：依總時數排序，列出每個人每個類別各待多久。"""
+    """某一天全伺服器的排行榜：只計算 REPORT_CATEGORIES 的時數，依總時數排序，列出每個人各類別各待多久。"""
     start = day_start_ts(day, TZ)
     end = min(day_start_ts(day + timedelta(days=1), TZ), now)
     by_user = aggregate_by_user(db.query_sessions(guild_id, None, start, end), start, end, now)
+    counted = {uid: {cat: totals.get(cat, 0) for cat in REPORT_CATEGORIES} for uid, totals in by_user.items()}
     ranking = sorted(
-        ((uid, totals, sum(totals.values())) for uid, totals in by_user.items()),
+        ((uid, totals, sum(totals.values())) for uid, totals in counted.items() if sum(totals.values())),
         key=lambda x: x[2],
         reverse=True,
     )
@@ -78,7 +81,7 @@ def build_daily_report(db: Database, guild_id: int, day, now: int) -> discord.Em
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, (uid, totals, total) in enumerate(ranking):
-        parts = [f"{CATEGORIES[cat][0]} {fmt_duration(totals[cat])}" for cat in CATEGORIES if totals.get(cat)]
+        parts = [f"{CATEGORIES[cat][0]} {fmt_duration(totals[cat])}" for cat in REPORT_CATEGORIES if totals[cat]]
         line = f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}>　**{fmt_duration(total)}**\n　" + "　".join(parts)
         if sum(len(l) + 1 for l in lines) + len(line) > 3900:
             lines.append(f"…還有 {len(ranking) - i} 人")
@@ -87,11 +90,11 @@ def build_daily_report(db: Database, guild_id: int, day, now: int) -> discord.Em
 
     embed = discord.Embed(
         title=f"🏆 {fmt_date(day)} 每日排行榜",
-        description="\n".join(lines) if lines else "這天沒有任何人進入追蹤中的語音頻道",
+        description="\n".join(lines) if lines else "這天沒有任何人進入讀書或工作頻道",
         color=0xF1C40F,
     )
-    grand = {cat: sum(t.get(cat, 0) for _, t, _ in ranking) for cat in CATEGORIES}
-    for cat in CATEGORIES:
+    grand = {cat: sum(t[cat] for _, t, _ in ranking) for cat in REPORT_CATEGORIES}
+    for cat in REPORT_CATEGORIES:
         embed.add_field(name=cat_label(cat), value=fmt_duration(grand[cat]), inline=True)
     embed.set_footer(text=f"共 {len(ranking)} 人・時區 {TZ.key}")
     return embed
