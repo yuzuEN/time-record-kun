@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     channel_id INTEGER NOT NULL,
     category   TEXT    NOT NULL,
     join_ts    INTEGER NOT NULL,
-    leave_ts   INTEGER
+    leave_ts   INTEGER,
+    source     TEXT    NOT NULL DEFAULT 'voice'  -- voice：進出語音頻道；button：按打卡面板的按鈕
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (guild_id, user_id, join_ts);
 CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions (leave_ts);
@@ -28,6 +29,12 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     report_channel_id INTEGER,                         -- 每日排行榜公告頻道，NULL 表示關閉
     report_time       INTEGER NOT NULL DEFAULT 0,      -- 每日排行榜公告時間，當地時間午夜後第幾分鐘
     report_last       TEXT                             -- 最後一次已處理每日排行榜的本地日期（YYYY-MM-DD）
+);
+
+CREATE TABLE IF NOT EXISTS panels (
+    guild_id   INTEGER PRIMARY KEY,  -- 每個伺服器只保留一個打卡面板
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -50,6 +57,9 @@ class Database:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(guild_settings)")}
         if "report_time" not in cols:
             self.conn.execute("ALTER TABLE guild_settings ADD COLUMN report_time INTEGER NOT NULL DEFAULT 0")
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(sessions)")}
+        if "source" not in cols:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'voice'")
 
     def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         cur = self.conn.execute(sql, params)
@@ -88,19 +98,22 @@ class Database:
 
     # ---------- 語音時段 ----------
 
-    def open_session(self, guild_id: int, user_id: int, channel_id: int, category: str, ts: int) -> None:
+    def open_session(
+        self, guild_id: int, user_id: int, channel_id: int, category: str, ts: int, source: str = "voice"
+    ) -> None:
         self._exec(
-            "INSERT INTO sessions (guild_id, user_id, channel_id, category, join_ts) VALUES (?, ?, ?, ?, ?)",
-            (guild_id, user_id, channel_id, category, ts),
+            "INSERT INTO sessions (guild_id, user_id, channel_id, category, join_ts, source) VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, channel_id, category, ts, source),
         )
 
-    def close_user_sessions(self, guild_id: int, user_id: int, ts: int) -> None:
-        """結束某使用者在該伺服器所有尚未結束的時段。"""
-        self._exec(
+    def close_user_sessions(self, guild_id: int, user_id: int, ts: int, source: Optional[str] = None) -> int:
+        """結束某使用者在該伺服器所有尚未結束的時段；指定 source 時只結束該來源的時段。回傳結束的時段數。"""
+        cur = self._exec(
             "UPDATE sessions SET leave_ts = MAX(join_ts, ?) "
-            "WHERE guild_id = ? AND user_id = ? AND leave_ts IS NULL",
-            (ts, guild_id, user_id),
+            "WHERE guild_id = ? AND user_id = ? AND leave_ts IS NULL AND (? IS NULL OR source = ?)",
+            (ts, guild_id, user_id, source, source),
         )
+        return cur.rowcount
 
     def close_channel_sessions(self, guild_id: int, channel_id: int, ts: int) -> None:
         self._exec(
@@ -124,6 +137,30 @@ class Database:
             "ORDER BY join_ts DESC LIMIT 1",
             (guild_id, user_id),
         ).fetchone()
+
+    def get_button_sessions(self, guild_id: int) -> List[sqlite3.Row]:
+        """目前用打卡面板計時中的所有時段，先打卡的排前面。"""
+        return self.conn.execute(
+            "SELECT * FROM sessions WHERE guild_id = ? AND source = 'button' AND leave_ts IS NULL ORDER BY join_ts",
+            (guild_id,),
+        ).fetchall()
+
+    def close_stale_button_sessions(self, now: int, max_seconds: int) -> List[int]:
+        """打卡超過 max_seconds 還沒離開的時段，視為忘記按離開，以 join_ts + max_seconds 結束。回傳受影響的伺服器。"""
+        with self.conn:
+            guilds = [
+                r["guild_id"] for r in self.conn.execute(
+                    "SELECT DISTINCT guild_id FROM sessions "
+                    "WHERE source = 'button' AND leave_ts IS NULL AND join_ts + ? <= ?",
+                    (max_seconds, now),
+                )
+            ]
+            self.conn.execute(
+                "UPDATE sessions SET leave_ts = join_ts + ? "
+                "WHERE source = 'button' AND leave_ts IS NULL AND join_ts + ? <= ?",
+                (max_seconds, max_seconds, now),
+            )
+        return guilds
 
     def query_sessions(self, guild_id: int, user_id: Optional[int], start: int, end: int) -> List[sqlite3.Row]:
         """取得與 [start, end) 有重疊的時段；user_id 為 None 時取全伺服器。"""
@@ -150,9 +187,9 @@ class Database:
                     # 刪除區間在時段中間：保留前半段，後半段另存一筆
                     self.conn.execute("UPDATE sessions SET leave_ts = ? WHERE id = ?", (start, s["id"]))
                     self.conn.execute(
-                        "INSERT INTO sessions (guild_id, user_id, channel_id, category, join_ts, leave_ts) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (guild_id, user_id, s["channel_id"], s["category"], end, leave),
+                        "INSERT INTO sessions (guild_id, user_id, channel_id, category, join_ts, leave_ts, source) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (guild_id, user_id, s["channel_id"], s["category"], end, leave, s["source"]),
                     )
         return len(rows)
 
@@ -195,6 +232,23 @@ class Database:
             "SELECT guild_id, report_channel_id, report_last, report_time FROM guild_settings "
             "WHERE report_channel_id IS NOT NULL"
         ).fetchall()
+
+    # ---------- 打卡面板 ----------
+
+    def set_panel(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        self._exec(
+            "INSERT INTO panels (guild_id, channel_id, message_id) VALUES (?, ?, ?) "
+            "ON CONFLICT (guild_id) DO UPDATE SET channel_id = excluded.channel_id, message_id = excluded.message_id",
+            (guild_id, channel_id, message_id),
+        )
+
+    def get_panel(self, guild_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT channel_id, message_id FROM panels WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+
+    def clear_panel(self, guild_id: int) -> None:
+        self._exec("DELETE FROM panels WHERE guild_id = ?", (guild_id,))
 
     # ---------- meta ----------
 

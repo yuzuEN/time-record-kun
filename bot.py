@@ -25,6 +25,8 @@ TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Taipei"))
 GUILD_ID = os.getenv("GUILD_ID")
 DB_PATH = os.getenv("DB_PATH", "timerecord.db")
 HEARTBEAT_SECONDS = 60
+# 打卡面板超過幾小時沒按離開就自動結束計時（視為忘記按），0 表示不限制
+PANEL_MAX_HOURS = float(os.getenv("PANEL_MAX_HOURS", "12"))
 
 # 類別代碼 -> (emoji, 顯示名稱)
 CATEGORIES = {
@@ -36,6 +38,8 @@ CATEGORIES = {
 # 每日排行榜只計算這些類別的時數
 REPORT_CATEGORIES = ("study", "work")
 CATEGORY_CHOICES =[app_commands.Choice(name=f"{e} {n}", value=k) for k, (e, n) in CATEGORIES.items()]
+# 打卡面板上的區域：類別代碼 -> 區域名稱（依按鈕順序，不含 Minecraft）
+PANEL_ZONES = {"work": "工作室", "study": "讀書室", "rest": "休息區"}
 
 log = logging.getLogger("timerecord")
 
@@ -43,6 +47,10 @@ log = logging.getLogger("timerecord")
 def cat_label(category: str) -> str:
     emoji, name = CATEGORIES.get(category, ("❔", category))
     return f"{emoji} {name}"
+
+
+def zone_label(category: str) -> str:
+    return f"{CATEGORIES[category][0]} {PANEL_ZONES.get(category, CATEGORIES[category][1])}"
 
 
 def fmt_clock(ts: int) -> str:
@@ -100,6 +108,30 @@ def build_daily_report(db: Database, guild_id: int, day, now: int) -> discord.Em
     return embed
 
 
+def build_panel_embed(db: Database, guild_id: int) -> discord.Embed:
+    """打卡面板：列出每個區域目前有誰、從什麼時候開始。<t:...:R> 由 Discord 客戶端自動更新，不需要一直編輯訊息。"""
+    embed = discord.Embed(
+        title="⏱️ 打卡面板",
+        description="按下按鈕進入區域開始計時，換區直接按另一個，結束時按「離開」。\n"
+                    "再按一次目前所在的區域可以查看已經待了多久。",
+        color=0x5865F2,
+    )
+    sessions = db.get_button_sessions(guild_id)
+    for cat in PANEL_ZONES:
+        here = [s for s in sessions if s["category"] == cat]
+        lines = []
+        for i, s in enumerate(here):
+            line = f"<@{s['user_id']}>　<t:{s['join_ts']}:R>"
+            if sum(len(l) + 1 for l in lines) + len(line) > 950:
+                lines.append(f"…還有 {len(here) - i} 人")
+                break
+            lines.append(line)
+        embed.add_field(name=f"{zone_label(cat)}（{len(here)}）", value="\n".join(lines) or "—", inline=True)
+    if PANEL_MAX_HOURS > 0:
+        embed.set_footer(text=f"超過 {PANEL_MAX_HOURS:g} 小時沒按離開會自動結束計時・人在追蹤的語音頻道裡時以語音頻道為準")
+    return embed
+
+
 async def send_report(channel, embed: discord.Embed) -> None:
     if isinstance(channel, discord.ForumChannel):
         # 論壇頻道：每天開一篇貼文，大家可以在底下留言
@@ -125,12 +157,20 @@ class TimeRecordBot(commands.Bot):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+        self.add_view(PanelView())  # 讓機器人重啟前發出的打卡面板按鈕繼續有效
         self.heartbeat.start()
 
     @tasks.loop(seconds=HEARTBEAT_SECONDS)
     async def heartbeat(self):
-        self.db.set_meta("last_alive", str(int(time.time())))
+        now = int(time.time())
+        self.db.set_meta("last_alive", str(now))
         if self.is_ready():
+            if PANEL_MAX_HOURS > 0:
+                try:
+                    for guild_id in self.db.close_stale_button_sessions(now, int(PANEL_MAX_HOURS * 3600)):
+                        await self.refresh_panel(guild_id)
+                except Exception:
+                    log.exception("結束逾時的打卡時段失敗")
             try:
                 await self.post_daily_reports()
             except Exception:
@@ -159,35 +199,59 @@ class TimeRecordBot(commands.Bot):
             except discord.HTTPException:
                 log.exception("無法在頻道 %s 發送每日排行榜", channel.id)
 
+    async def refresh_panel(self, guild_id: int):
+        """更新伺服器打卡面板上每個區域的名單。"""
+        panel = self.db.get_panel(guild_id)
+        if panel is None:
+            return
+        message = self.get_partial_messageable(panel["channel_id"]).get_partial_message(panel["message_id"])
+        try:
+            await message.edit(embed=build_panel_embed(self.db, guild_id))
+        except discord.NotFound:
+            self.db.clear_panel(guild_id)  # 面板訊息被刪掉了
+        except discord.HTTPException:
+            log.exception("無法更新打卡面板（伺服器 %s）", guild_id)
+
     async def on_ready(self):
         log.info("已登入為 %s (id=%s)", self.user, self.user.id)
         if not self.reconciled:
             self.reconciled = True
-            self.reconcile()
+            for guild_id in self.reconcile():
+                await self.refresh_panel(guild_id)
 
-    def reconcile(self):
-        """啟動時校正：機器人離線期間可能漏掉的進出事件。"""
+    def reconcile(self) -> set:
+        """啟動時校正：機器人離線期間可能漏掉的進出事件。回傳打卡面板名單有變動的伺服器。"""
         now = int(time.time())
         cutoff = min(self.prev_alive or now, now)
+        changed = set()
 
-        # 1) 未結束的時段：若使用者已不在該頻道，就以最後存活時間結束
+        # 1) 未結束的語音時段：若使用者已不在該頻道，就以最後存活時間結束（面板打卡不受語音狀態影響）
         for s in self.db.get_open_sessions():
+            if s["source"] == "button":
+                continue
             guild = self.get_guild(s["guild_id"])
             member = guild.get_member(s["user_id"]) if guild else None
             voice_channel = member.voice.channel if member and member.voice else None
             if voice_channel is None or voice_channel.id != s["channel_id"]:
                 self.db.close_session(s["id"], cutoff)
 
-        # 2) 目前已在追蹤頻道內但沒有時段的人，從現在開始記錄
+        # 2) 目前已在追蹤頻道內但沒有語音時段的人，從現在開始記錄（語音頻道優先於面板打卡）
         for guild in self.guilds:
             for channel_id, category in self.db.list_channels(guild.id):
                 channel = guild.get_channel(channel_id)
                 if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
                     continue
                 for m in channel.members:
-                    if not m.bot and self.db.get_open_session(guild.id, m.id) is None:
-                        self.db.open_session(guild.id, m.id, channel.id, category, now)
+                    if m.bot:
+                        continue
+                    current = self.db.get_open_session(guild.id, m.id)
+                    if current is not None and current["source"] == "voice":
+                        continue
+                    if self.db.close_user_sessions(guild.id, m.id, now, source="button"):
+                        changed.add(guild.id)
+                    self.db.open_session(guild.id, m.id, channel.id, category, now)
         log.info("啟動校正完成")
+        return changed
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.bot or before.channel == after.channel:
@@ -195,10 +259,13 @@ class TimeRecordBot(commands.Bot):
         now = int(time.time())
         guild_id = member.guild.id
         if before.channel is not None:
-            self.db.close_user_sessions(guild_id, member.id, now)
+            self.db.close_user_sessions(guild_id, member.id, now, source="voice")
         if after.channel is not None:
             category = self.db.get_category(guild_id, after.channel.id)
             if category:
+                # 語音頻道優先：進入追蹤中的語音頻道就結束面板打卡，避免重複計時
+                if self.db.close_user_sessions(guild_id, member.id, now, source="button"):
+                    await self.refresh_panel(guild_id)
                 self.db.open_session(guild_id, member.id, after.channel.id, category, now)
 
 
@@ -216,11 +283,15 @@ async def setup_cmd(interaction: discord.Interaction, channel: discord.VoiceChan
     bot.db.set_channel(interaction.guild_id, channel.id, category.value)
     # 頻道裡已經有人的話，以新類別重新開始計時
     now = int(time.time())
+    panel_changed = False
     for m in channel.members:
         if not m.bot:
+            panel_changed |= bool(bot.db.close_user_sessions(interaction.guild_id, m.id, now, source="button"))
             bot.db.close_user_sessions(interaction.guild_id, m.id, now)
             bot.db.open_session(interaction.guild_id, m.id, channel.id, category.value, now)
     await interaction.response.send_message(f"✅ 已將 {channel.mention} 設定為 **{cat_label(category.value)}**")
+    if panel_changed:
+        await bot.refresh_panel(interaction.guild_id)
 
 
 @bot.tree.command(name="unset", description="停止追蹤某個語音頻道")
@@ -440,6 +511,97 @@ async def report_post_cmd(interaction: discord.Interaction, date: str):
 bot.tree.add_command(report_group)
 
 
+# ================= 打卡面板 =================
+
+async def panel_enter(interaction: discord.Interaction, category: str):
+    """按下區域按鈕：開始在該區計時；已在別區就換過去。"""
+    guild_id, user = interaction.guild_id, interaction.user
+    now = int(time.time())
+    current = bot.db.get_open_session(guild_id, user.id)
+    if current is not None and current["source"] == "voice":
+        await interaction.response.send_message(
+            f"你正在語音頻道 <#{current['channel_id']}>（{cat_label(current['category'])}）計時，"
+            "離開語音頻道後才能用面板打卡。",
+            ephemeral=True,
+        )
+        return
+    if current is not None and current["category"] == category:
+        join = current["join_ts"]
+        await interaction.response.send_message(
+            f"你已經在 **{zone_label(category)}**，從 <t:{join}:t> 開始（<t:{join}:R>），"
+            f"目前已待 **{fmt_duration(now - join)}**",
+            ephemeral=True,
+        )
+        return
+
+    bot.db.close_user_sessions(guild_id, user.id, now)
+    bot.db.open_session(guild_id, user.id, interaction.channel_id, category, now, source="button")
+    msg = f"✅ 你正在 **{zone_label(category)}**，從 <t:{now}:t> 開始計時"
+    if current is not None:
+        msg += f"\n（剛才在 {zone_label(current['category'])} 待了 {fmt_duration(now - current['join_ts'])}）"
+    await interaction.response.send_message(msg, ephemeral=True)
+    await bot.refresh_panel(guild_id)
+
+
+async def panel_leave(interaction: discord.Interaction):
+    guild_id, user = interaction.guild_id, interaction.user
+    now = int(time.time())
+    current = bot.db.get_open_session(guild_id, user.id)
+    if current is None or current["source"] != "button":
+        hint = "，離開語音頻道就會結束計時" if current is not None else ""
+        await interaction.response.send_message(f"你目前沒有用面板打卡{hint}。", ephemeral=True)
+        return
+    bot.db.close_user_sessions(guild_id, user.id, now, source="button")
+    await interaction.response.send_message(
+        f"🚪 已離開 **{zone_label(current['category'])}**，這次待了 **{fmt_duration(now - current['join_ts'])}**",
+        ephemeral=True,
+    )
+    await bot.refresh_panel(guild_id)
+
+
+class PanelView(discord.ui.View):
+    """打卡面板的按鈕。custom_id 固定，所以機器人重啟後舊面板上的按鈕仍然有效。"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        for cat, name in PANEL_ZONES.items():
+            button = discord.ui.Button(
+                label=name, emoji=CATEGORIES[cat][0], style=discord.ButtonStyle.primary, custom_id=f"panel:{cat}"
+            )
+            button.callback = lambda interaction, cat=cat: panel_enter(interaction, cat)
+            self.add_item(button)
+        leave = discord.ui.Button(label="離開", emoji="🚪", style=discord.ButtonStyle.secondary, custom_id="panel:leave")
+        leave.callback = panel_leave
+        self.add_item(leave)
+
+
+@bot.tree.command(name="panel", description="在這個頻道發佈打卡面板，按按鈕就能開始工作/讀書/休息計時")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def panel_cmd(interaction: discord.Interaction):
+    perms = interaction.app_permissions
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        await interaction.response.send_message(
+            "機器人在這個頻道沒有「檢視頻道」「發送訊息」「嵌入連結」權限，請先調整頻道權限。", ephemeral=True
+        )
+        return
+    message = await interaction.channel.send(embed=build_panel_embed(bot.db, interaction.guild_id), view=PanelView())
+
+    # 每個伺服器只保留一個面板：刪掉舊的，避免名單不同步
+    old = bot.db.get_panel(interaction.guild_id)
+    bot.db.set_panel(interaction.guild_id, message.channel.id, message.id)
+    note = ""
+    if old is not None:
+        try:
+            await bot.get_partial_messageable(old["channel_id"]).get_partial_message(old["message_id"]).delete()
+            note = "，舊的面板已刪除"
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            note = f"。舊的面板（<#{old['channel_id']}>）無法自動刪除，請手動刪掉"
+    await interaction.response.send_message(f"✅ 已發佈打卡面板{note}", ephemeral=True)
+
+
 # ================= 統計指令 =================
 
 async def ensure_can_view(interaction: discord.Interaction, target: discord.abc.User) -> bool:
@@ -475,7 +637,7 @@ async def today_cmd(interaction: discord.Interaction, member: Optional[discord.M
 
     current = bot.db.get_open_session(interaction.guild_id, target.id)
     if current:
-        embed.set_footer(text=f"目前在 {cat_label(current['category'])} 頻道，已待 {fmt_duration(now - current['join_ts'])}")
+        embed.set_footer(text=f"目前在 {cat_label(current['category'])}，已待 {fmt_duration(now - current['join_ts'])}")
     await interaction.response.send_message(embed=embed)
 
 
@@ -559,7 +721,8 @@ async def log_cmd(interaction: discord.Interaction, date: Optional[str] = None, 
             leave_txt = fmt_clock(leave)
         duration = fmt_duration((leave if leave is not None else now) - s["join_ts"])
         emoji = CATEGORIES.get(s["category"], ("❔",))[0]
-        lines.append(f"{emoji} <#{s['channel_id']}>　`{join_txt} → {leave_txt}`　({duration})")
+        where = f"{PANEL_ZONES.get(s['category'], s['category'])}（面板）" if s["source"] == "button" else f"<#{s['channel_id']}>"
+        lines.append(f"{emoji} {where}　`{join_txt} → {leave_txt}`　({duration})")
 
     description = "\n".join(lines) if lines else "這天沒有任何紀錄"
     if len(description) > 4000:
@@ -605,7 +768,7 @@ async def channeltime_cmd(interaction: discord.Interaction, date: Optional[str] 
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="status", description="查看目前在哪個追蹤頻道、待了多久")
+@bot.tree.command(name="status", description="查看目前在哪裡計時、待了多久")
 @app_commands.describe(member="要查詢的成員（預設為自己）")
 @app_commands.guild_only()
 async def status_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
@@ -614,12 +777,15 @@ async def status_cmd(interaction: discord.Interaction, member: Optional[discord.
         return
     current = bot.db.get_open_session(interaction.guild_id, target.id)
     if current is None:
-        await interaction.response.send_message(f"**{target.display_name}** 目前不在任何追蹤中的語音頻道")
+        await interaction.response.send_message(f"**{target.display_name}** 目前不在追蹤中的語音頻道，也沒有用面板打卡")
         return
     elapsed = int(time.time()) - current["join_ts"]
+    if current["source"] == "button":
+        where = f"**{zone_label(current['category'])}**（打卡面板）"
+    else:
+        where = f"<#{current['channel_id']}>（{cat_label(current['category'])}）"
     await interaction.response.send_message(
-        f"**{target.display_name}** 從 `{fmt_clock(current['join_ts'])}` 起在 <#{current['channel_id']}>"
-        f"（{cat_label(current['category'])}），已待 **{fmt_duration(elapsed)}**"
+        f"**{target.display_name}** 從 `{fmt_clock(current['join_ts'])}` 起在 {where}，已待 **{fmt_duration(elapsed)}**"
     )
 
 
@@ -669,7 +835,7 @@ async def export_cmd(interaction: discord.Interaction, days: app_commands.Range[
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["category", "channel_id", "join_time", "leave_time", "duration_minutes"])
+    writer.writerow(["category", "channel_id", "join_time", "leave_time", "duration_minutes", "source"])
     for s in sessions:
         leave = s["leave_ts"]
         writer.writerow([
@@ -678,6 +844,7 @@ async def export_cmd(interaction: discord.Interaction, days: app_commands.Range[
             datetime.fromtimestamp(s["join_ts"], TZ).isoformat(timespec="seconds"),
             datetime.fromtimestamp(leave, TZ).isoformat(timespec="seconds") if leave is not None else "",
             round(((leave if leave is not None else now) - s["join_ts"]) / 60, 1),
+            s["source"],
         ])
     data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))  # 加 BOM 讓 Excel 正確顯示中文
     filename = f"timerecord_{target.id}_{datetime.now(TZ):%Y%m%d}.csv"
