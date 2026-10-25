@@ -118,6 +118,8 @@ python bot.py
 
 > 💡 建議在 Railway 服務的 **Settings** 開啟 **Wait for CI**：push 之後會等 GitHub Actions 的測試通過才部署，測試失敗就不會把有問題的版本上線（見 [6. 執行測試](#6-執行測試)）。
 
+> 💡 push 之後如果 Railway 沒有自動部署，可以在服務頁面按 `Ctrl+K` 選 **Deploy latest commit**。注意：在某一筆舊部署上按「Redeploy」只會重新部署那筆舊的 commit。
+
 其他平台（VPS、樹莓派、NAS）也可以，只要能長時間執行 `python bot.py` 即可。
 
 ---
