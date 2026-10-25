@@ -1,4 +1,5 @@
 """打卡面板（/panel）的測試。執行：python -m unittest discover tests"""
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -57,12 +58,14 @@ class PanelDbTest(unittest.TestCase):
         self.assertEqual(self.db.close_user_sessions(G, ME, T0 + 60), 1)
         self.assertEqual(open_rows(self.db), [])
 
-    def test_button_sessions_listed_in_join_order(self):
+    def test_guild_open_sessions_listed_in_join_order(self):
         self.db.open_session(G, OTHER, PANEL_CH, "study", T0 + 10, source="button")
         self.db.open_session(G, ME, PANEL_CH, "study", T0, source="button")
-        self.db.open_session(G, ME + 1, VOICE_CH, "study", T0, source="voice")
+        self.db.open_session(G, ME + 1, VOICE_CH, "study", T0 + 5, source="voice")
+        self.db.open_session(G, ME + 2, VOICE_CH, "study", T0, source="voice")
+        self.db.close_user_sessions(G, ME + 2, T0 + 1)
         self.db.open_session(G + 1, ME, PANEL_CH, "study", T0, source="button")
-        self.assertEqual([r["user_id"] for r in self.db.get_button_sessions(G)], [ME, OTHER])
+        self.assertEqual([r["user_id"] for r in self.db.get_guild_open_sessions(G)], [ME, ME + 1, OTHER])
 
     def test_stale_button_sessions_are_closed_at_limit(self):
         self.db.open_session(G, ME, PANEL_CH, "study", T0, source="button")
@@ -112,6 +115,7 @@ class PanelBotTestCase(unittest.IsolatedAsyncioTestCase):
         for target, attr, value in (
             (bot.bot, "db", self.db),
             (bot.bot, "refresh_panel", AsyncMock()),
+            (bot.bot, "request_panel_refresh", MagicMock()),
             (bot.time, "time", MagicMock(return_value=T0 + 600)),
         ):
             p = patch.object(target, attr, value)
@@ -204,13 +208,66 @@ class VoicePriorityTest(PanelBotTestCase):
         self.db.open_session(G, ME, PANEL_CH, "work", T0, source="button")
         await bot.bot.on_voice_state_update(self.member(), self.state(None), self.state(VOICE_CH))
         self.assertEqual(open_rows(self.db), [(ME, "study", "voice", self.now)])
-        bot.bot.refresh_panel.assert_awaited_once_with(G)
+        bot.bot.request_panel_refresh.assert_called_once_with(G)
 
     async def test_untracked_voice_does_not_touch_button_session(self):
         self.db.open_session(G, ME, PANEL_CH, "work", T0, source="button")
         await bot.bot.on_voice_state_update(self.member(), self.state(None), self.state(VOICE_CH + 1))
         await bot.bot.on_voice_state_update(self.member(), self.state(VOICE_CH + 1), self.state(None))
         self.assertEqual(open_rows(self.db), [(ME, "work", "button", T0)])
+        bot.bot.request_panel_refresh.assert_not_called()
+
+    async def test_joining_and_leaving_zone_voice_refreshes_panel(self):
+        self.db.set_channel(G, VOICE_CH, "rest")
+        await bot.bot.on_voice_state_update(self.member(), self.state(None), self.state(VOICE_CH))
+        await bot.bot.on_voice_state_update(self.member(), self.state(VOICE_CH), self.state(None))
+        self.assertEqual(bot.bot.request_panel_refresh.call_count, 2)
+
+    async def test_minecraft_voice_does_not_refresh_panel(self):
+        self.db.set_channel(G, VOICE_CH, "minecraft")
+        await bot.bot.on_voice_state_update(self.member(), self.state(None), self.state(VOICE_CH))
+        await bot.bot.on_voice_state_update(self.member(), self.state(VOICE_CH), self.state(None))
+        self.assertEqual(open_rows(self.db), [])
+        bot.bot.request_panel_refresh.assert_not_called()
+
+
+class PanelRefreshThrottleTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        for target, attr, value in (
+            (bot.bot, "refresh_panel", AsyncMock()),
+            (bot.bot, "panel_refreshed_at", {}),
+            (bot.bot, "panel_refresh_tasks", {}),
+            (bot.time, "monotonic", MagicMock(return_value=1000.0)),
+            (bot.asyncio, "sleep", AsyncMock()),
+        ):
+            p = patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    async def run_pending(self):
+        await asyncio.gather(*bot.bot.panel_refresh_tasks.values())
+
+    async def test_first_refresh_is_immediate(self):
+        bot.bot.request_panel_refresh(G)
+        await self.run_pending()
+        bot.asyncio.sleep.assert_awaited_once_with(0)
+        bot.bot.refresh_panel.assert_awaited_once_with(G)
+        self.assertEqual(bot.bot.panel_refresh_tasks, {})
+
+    async def test_changes_within_interval_are_merged(self):
+        bot.bot.panel_refreshed_at[G] = 1000.0 - 10
+        for _ in range(5):
+            bot.bot.request_panel_refresh(G)
+        await self.run_pending()
+        bot.asyncio.sleep.assert_awaited_once_with(bot.PANEL_REFRESH_SECONDS - 10)
+        bot.bot.refresh_panel.assert_awaited_once_with(G)
+
+    async def test_can_schedule_again_after_refresh(self):
+        bot.bot.request_panel_refresh(G)
+        await self.run_pending()
+        bot.bot.request_panel_refresh(G)
+        await self.run_pending()
+        self.assertEqual(bot.bot.refresh_panel.await_count, 2)
 
 
 class PanelEmbedTest(unittest.TestCase):
@@ -218,11 +275,13 @@ class PanelEmbedTest(unittest.TestCase):
         db = Database(":memory:")
         db.open_session(G, ME, PANEL_CH, "study", T0, source="button")
         db.open_session(G, OTHER, PANEL_CH, "study", T0 + 5, source="button")
-        db.open_session(G, ME + 1, VOICE_CH, "work", T0)  # 語音頻道的人不列在面板上
+        db.open_session(G, ME + 1, VOICE_CH, "work", T0)
+        db.open_session(G, ME + 2, VOICE_CH, "study", T0 + 3)
+        db.open_session(G, ME + 3, VOICE_CH, "minecraft", T0)  # Minecraft 不在面板上
         fields = {f.name: f.value for f in bot.build_panel_embed(db, G).fields}
         self.assertEqual(fields, {
-            "💼 工作室（0）": "—",
-            "📚 讀書室（2）": f"<@{ME}>　<t:{T0}:R>\n<@{OTHER}>　<t:{T0 + 5}:R>",
+            "💼 工作室（1）": f"🎧 <@{ME + 1}>　<t:{T0}:R>",
+            "📚 讀書室（3）": f"<@{ME}>　<t:{T0}:R>\n🎧 <@{ME + 2}>　<t:{T0 + 3}:R>\n<@{OTHER}>　<t:{T0 + 5}:R>",
             "☕ 休息區（0）": "—",
         })
 

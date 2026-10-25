@@ -138,10 +138,10 @@ class Database:
             (guild_id, user_id),
         ).fetchone()
 
-    def get_button_sessions(self, guild_id: int) -> List[sqlite3.Row]:
-        """目前用打卡面板計時中的所有時段，先打卡的排前面。"""
+    def get_guild_open_sessions(self, guild_id: int) -> List[sqlite3.Row]:
+        """伺服器目前所有計時中的時段（語音頻道與打卡面板），先開始的排前面。"""
         return self.conn.execute(
-            "SELECT * FROM sessions WHERE guild_id = ? AND source = 'button' AND leave_ts IS NULL ORDER BY join_ts",
+            "SELECT * FROM sessions WHERE guild_id = ? AND leave_ts IS NULL ORDER BY join_ts, id",
             (guild_id,),
         ).fetchall()
 

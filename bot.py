@@ -29,6 +29,8 @@ DB_PATH = os.getenv("DB_PATH", "timerecord.db")
 HEARTBEAT_SECONDS = 60
 # 打卡面板超過幾小時沒按離開就自動結束計時（視為忘記按），0 表示不限制
 PANEL_MAX_HOURS = float(os.getenv("PANEL_MAX_HOURS", "12"))
+# 語音頻道進出時，打卡面板最多每幾秒更新一次，避免有人頻繁進出時一直編輯訊息而被限速
+PANEL_REFRESH_SECONDS = 30
 # 每日排行榜遇到暫時性錯誤（被限速、Discord 伺服器錯誤、連線失敗）時，隔多久重試
 REPORT_RETRY_SECONDS = 15 * 60
 # 登入被 Discord 限速（429）時，第一次等多久再試，之後每次加倍，最多等到 LOGIN_RETRY_MAX_SECONDS
@@ -120,15 +122,16 @@ def build_panel_embed(db: Database, guild_id: int) -> discord.Embed:
     embed = discord.Embed(
         title="⏱️ 打卡面板",
         description="按下按鈕進入區域開始計時，換區直接按另一個，結束時按「離開」。\n"
-                    "再按一次目前所在的區域可以查看已經待了多久。",
+                    "再按一次目前所在的區域可以查看已經待了多久。🎧 表示在語音頻道裡。",
         color=0x5865F2,
     )
-    sessions = db.get_button_sessions(guild_id)
+    sessions = db.get_guild_open_sessions(guild_id)
     for cat in PANEL_ZONES:
         here = [s for s in sessions if s["category"] == cat]
         lines = []
         for i, s in enumerate(here):
-            line = f"<@{s['user_id']}>　<t:{s['join_ts']}:R>"
+            icon = "🎧 " if s["source"] == "voice" else ""
+            line = f"{icon}<@{s['user_id']}>　<t:{s['join_ts']}:R>"
             if sum(len(l) + 1 for l in lines) + len(line) > 950:
                 lines.append(f"…還有 {len(here) - i} 人")
                 break
@@ -157,6 +160,8 @@ class TimeRecordBot(commands.Bot):
         self.prev_alive = int(last_alive) if last_alive else None
         self.reconciled = False
         self.report_retry_at = {}  # guild_id -> 每日排行榜下次可以重試的時間
+        self.panel_refreshed_at = {}  # guild_id -> 打卡面板上次更新的時間（time.monotonic）
+        self.panel_refresh_tasks = {}  # guild_id -> 等待中的面板更新
 
     async def setup_hook(self):
         if GUILD_ID:
@@ -230,6 +235,7 @@ class TimeRecordBot(commands.Bot):
         panel = self.db.get_panel(guild_id)
         if panel is None:
             return
+        self.panel_refreshed_at[guild_id] = time.monotonic()
         message = self.get_partial_messageable(panel["channel_id"]).get_partial_message(panel["message_id"])
         try:
             await message.edit(embed=build_panel_embed(self.db, guild_id))
@@ -238,18 +244,32 @@ class TimeRecordBot(commands.Bot):
         except discord.HTTPException:
             log.exception("無法更新打卡面板（伺服器 %s）", guild_id)
 
+    def request_panel_refresh(self, guild_id: int) -> None:
+        """排程更新打卡面板：距離上次更新不到 PANEL_REFRESH_SECONDS 就等到時間到，期間的變動合併成一次。"""
+        if guild_id in self.panel_refresh_tasks:
+            return
+        wait = self.panel_refreshed_at.get(guild_id, float("-inf")) + PANEL_REFRESH_SECONDS - time.monotonic()
+        self.panel_refresh_tasks[guild_id] = asyncio.create_task(self._delayed_panel_refresh(guild_id, max(wait, 0)))
+
+    async def _delayed_panel_refresh(self, guild_id: int, wait: float) -> None:
+        try:
+            await asyncio.sleep(wait)
+        finally:
+            self.panel_refresh_tasks.pop(guild_id, None)  # 更新途中的新變動會再排一次
+        await self.refresh_panel(guild_id)
+
     async def on_ready(self):
         log.info("已登入為 %s (id=%s)", self.user, self.user.id)
         if not self.reconciled:
             self.reconciled = True
-            for guild_id in self.reconcile():
-                await self.refresh_panel(guild_id)
+            self.reconcile()
+            for guild in self.guilds:
+                await self.refresh_panel(guild.id)  # 離線期間語音頻道裡的人可能變了
 
-    def reconcile(self) -> set:
-        """啟動時校正：機器人離線期間可能漏掉的進出事件。回傳打卡面板名單有變動的伺服器。"""
+    def reconcile(self) -> None:
+        """啟動時校正：機器人離線期間可能漏掉的進出事件。"""
         now = int(time.time())
         cutoff = min(self.prev_alive or now, now)
-        changed = set()
 
         # 1) 未結束的語音時段：若使用者已不在該頻道，就以最後存活時間結束（面板打卡不受語音狀態影響）
         for s in self.db.get_open_sessions():
@@ -273,26 +293,28 @@ class TimeRecordBot(commands.Bot):
                     current = self.db.get_open_session(guild.id, m.id)
                     if current is not None and current["source"] == "voice":
                         continue
-                    if self.db.close_user_sessions(guild.id, m.id, now, source="button"):
-                        changed.add(guild.id)
+                    self.db.close_user_sessions(guild.id, m.id, now, source="button")
                     self.db.open_session(guild.id, m.id, channel.id, category, now)
         log.info("啟動校正完成")
-        return changed
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.bot or before.channel == after.channel:
             return  # 靜音、開關鏡頭等狀態變化不算進出
         now = int(time.time())
         guild_id = member.guild.id
+        panel_changed = False
         if before.channel is not None:
-            self.db.close_user_sessions(guild_id, member.id, now, source="voice")
+            if self.db.close_user_sessions(guild_id, member.id, now, source="voice"):
+                panel_changed |= self.db.get_category(guild_id, before.channel.id) in PANEL_ZONES
         if after.channel is not None:
             category = self.db.get_category(guild_id, after.channel.id)
             if category:
                 # 語音頻道優先：進入追蹤中的語音頻道就結束面板打卡，避免重複計時
-                if self.db.close_user_sessions(guild_id, member.id, now, source="button"):
-                    await self.refresh_panel(guild_id)
+                panel_changed |= bool(self.db.close_user_sessions(guild_id, member.id, now, source="button"))
+                panel_changed |= category in PANEL_ZONES
                 self.db.open_session(guild_id, member.id, after.channel.id, category, now)
+        if panel_changed:
+            self.request_panel_refresh(guild_id)
 
 
 bot = TimeRecordBot()
@@ -312,12 +334,12 @@ async def setup_cmd(interaction: discord.Interaction, channel: discord.VoiceChan
     panel_changed = False
     for m in channel.members:
         if not m.bot:
-            panel_changed |= bool(bot.db.close_user_sessions(interaction.guild_id, m.id, now, source="button"))
+            panel_changed = True
             bot.db.close_user_sessions(interaction.guild_id, m.id, now)
             bot.db.open_session(interaction.guild_id, m.id, channel.id, category.value, now)
     await interaction.response.send_message(f"✅ 已將 {channel.mention} 設定為 **{cat_label(category.value)}**")
     if panel_changed:
-        await bot.refresh_panel(interaction.guild_id)
+        bot.request_panel_refresh(interaction.guild_id)
 
 
 @bot.tree.command(name="unset", description="停止追蹤某個語音頻道")
@@ -328,6 +350,7 @@ async def unset_cmd(interaction: discord.Interaction, channel: discord.VoiceChan
     if bot.db.unset_channel(interaction.guild_id, channel.id):
         bot.db.close_channel_sessions(interaction.guild_id, channel.id, int(time.time()))
         await interaction.response.send_message(f"🗑️ 已停止追蹤 {channel.mention}")
+        bot.request_panel_refresh(interaction.guild_id)
     else:
         await interaction.response.send_message(f"{channel.mention} 本來就沒有被追蹤", ephemeral=True)
 
