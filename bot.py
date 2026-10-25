@@ -31,6 +31,9 @@ HEARTBEAT_SECONDS = 60
 PANEL_MAX_HOURS = float(os.getenv("PANEL_MAX_HOURS", "12"))
 # 每日排行榜遇到暫時性錯誤（被限速、Discord 伺服器錯誤、連線失敗）時，隔多久重試
 REPORT_RETRY_SECONDS = 15 * 60
+# 登入被 Discord 限速（429）時，第一次等多久再試，之後每次加倍，最多等到 LOGIN_RETRY_MAX_SECONDS
+LOGIN_RETRY_SECONDS = 60
+LOGIN_RETRY_MAX_SECONDS = 30 * 60
 
 # 類別代碼 -> (emoji, 顯示名稱)
 CATEGORIES = {
@@ -878,7 +881,38 @@ async def export_cmd(interaction: discord.Interaction, days: app_commands.Range[
     )
 
 
+async def login_with_retry(token: str) -> None:
+    """登入；被限速時在程式內等待後重試，而不是直接結束讓平台每幾秒重啟一次、反覆撞上封鎖。"""
+    delay = LOGIN_RETRY_SECONDS
+    while True:
+        try:
+            await bot.login(token)
+            return
+        except discord.HTTPException as e:
+            if e.status != 429:
+                raise
+            try:
+                retry_after = float(e.response.headers.get("Retry-After", 0))
+            except (TypeError, ValueError):
+                retry_after = 0
+            wait = max(delay, retry_after)
+            log.warning("登入被 Discord 限速（%s），%d 秒後重試", e.text, wait)
+            await bot.http.close()
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, LOGIN_RETRY_MAX_SECONDS)
+
+
+async def main() -> None:
+    async with bot:
+        await login_with_retry(TOKEN)
+        await bot.connect()
+
+
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("請在 .env 設定 DISCORD_TOKEN")
-    bot.run(TOKEN, log_level=logging.INFO)
+    discord.utils.setup_logging(level=logging.INFO)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

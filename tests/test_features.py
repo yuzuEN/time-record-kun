@@ -726,5 +726,42 @@ class CommandRegistrationTest(unittest.TestCase):
         self.assertTrue(cmd.guild_only)
 
 
+class LoginWithRetryTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        for name, mock in (("login", AsyncMock()), ("http", MagicMock())):
+            p = patch.object(bot.bot, name, mock)
+            p.start()
+            self.addCleanup(p.stop)
+        bot.bot.http.close = AsyncMock()
+        p = patch.object(bot.asyncio, "sleep", AsyncMock())
+        self.sleep = p.start()
+        self.addCleanup(p.stop)
+
+    def rate_limited(self, retry_after=None):
+        resp = MagicMock(status=429)
+        resp.headers = {"Retry-After": retry_after} if retry_after else {}
+        return discord.HTTPException(resp, "You are being blocked")
+
+    async def test_retries_with_backoff_until_login_succeeds(self):
+        bot.bot.login.side_effect = [self.rate_limited(), self.rate_limited(), self.rate_limited("300"), None]
+        with self.assertLogs("timerecord", "WARNING"):
+            await bot.login_with_retry("token")
+        self.assertEqual(bot.bot.login.await_count, 4)
+        waits = [c.args[0] for c in self.sleep.await_args_list]
+        self.assertEqual(waits, [bot.LOGIN_RETRY_SECONDS, bot.LOGIN_RETRY_SECONDS * 2, 300])
+
+    async def test_backoff_is_capped(self):
+        bot.bot.login.side_effect = [self.rate_limited()] * 10 + [None]
+        with self.assertLogs("timerecord", "WARNING"):
+            await bot.login_with_retry("token")
+        self.assertEqual(self.sleep.await_args_list[-1].args[0], bot.LOGIN_RETRY_MAX_SECONDS)
+
+    async def test_other_errors_are_raised(self):
+        bot.bot.login.side_effect = discord.LoginFailure("bad token")
+        with self.assertRaises(discord.LoginFailure):
+            await bot.login_with_retry("token")
+        self.sleep.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
