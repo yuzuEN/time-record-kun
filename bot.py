@@ -1,4 +1,5 @@
 """Discord 語音頻道時間記錄機器人。"""
+import asyncio
 import csv
 import io
 import logging
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -27,6 +29,8 @@ DB_PATH = os.getenv("DB_PATH", "timerecord.db")
 HEARTBEAT_SECONDS = 60
 # 打卡面板超過幾小時沒按離開就自動結束計時（視為忘記按），0 表示不限制
 PANEL_MAX_HOURS = float(os.getenv("PANEL_MAX_HOURS", "12"))
+# 每日排行榜遇到暫時性錯誤（被限速、Discord 伺服器錯誤、連線失敗）時，隔多久重試
+REPORT_RETRY_SECONDS = 15 * 60
 
 # 類別代碼 -> (emoji, 顯示名稱)
 CATEGORIES = {
@@ -149,6 +153,7 @@ class TimeRecordBot(commands.Bot):
         last_alive = self.db.get_meta("last_alive")
         self.prev_alive = int(last_alive) if last_alive else None
         self.reconciled = False
+        self.report_retry_at = {}  # guild_id -> 每日排行榜下次可以重試的時間
 
     async def setup_hook(self):
         if GUILD_ID:
@@ -187,7 +192,9 @@ class TimeRecordBot(commands.Bot):
                 continue
             if minute < row["report_time"]:
                 continue
-            # 先標記為已處理，失敗也不每分鐘重試，避免權限錯誤時不斷洗 log
+            if self.report_retry_at.get(row["guild_id"], 0) > now:
+                continue
+            # 先標記為已處理，權限等永久性錯誤不每分鐘重試，避免不斷洗 log
             self.db.set_report_last(row["guild_id"], today.isoformat())
             channel = self.get_channel(row["report_channel_id"])
             if channel is None:
@@ -196,8 +203,24 @@ class TimeRecordBot(commands.Bot):
             embed = build_daily_report(self.db, row["guild_id"], today - timedelta(days=1), now)
             try:
                 await send_report(channel, embed)
-            except discord.HTTPException:
-                log.exception("無法在頻道 %s 發送每日排行榜", channel.id)
+            except discord.HTTPException as e:
+                if e.status == 429 or e.status >= 500:
+                    self.schedule_report_retry(row, now, e)
+                else:
+                    log.exception("無法在頻道 %s 發送每日排行榜", channel.id)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                self.schedule_report_retry(row, now, e)
+            else:
+                self.report_retry_at.pop(row["guild_id"], None)
+
+    def schedule_report_retry(self, row, now: int, error: Exception) -> None:
+        """暫時性錯誤：把已處理日期改回去，過一段時間再重試（重啟後也會補發）。"""
+        self.db.set_report_last(row["guild_id"], row["report_last"])
+        self.report_retry_at[row["guild_id"]] = now + REPORT_RETRY_SECONDS
+        log.warning(
+            "每日排行榜暫時無法發送到頻道 %s（%s），%d 分鐘後重試",
+            row["report_channel_id"], error, REPORT_RETRY_SECONDS // 60,
+        )
 
     async def refresh_panel(self, guild_id: int):
         """更新伺服器打卡面板上每個區域的名單。"""

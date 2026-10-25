@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 os.environ["DB_PATH"] = ":memory:"
 os.environ["TIMEZONE"] = "Asia/Taipei"
 
+import aiohttp  # noqa: E402
 import discord  # noqa: E402
 from discord import app_commands  # noqa: E402
 
@@ -470,6 +471,36 @@ class PostDailyReportsTest(BotTestCase):
         self.assertEqual(self.last(), self.today.isoformat())
         await bot.bot.post_daily_reports()
         self.channel.send.assert_called_once()
+
+    async def test_rate_limited_send_is_retried_later(self):
+        self.addCleanup(bot.bot.report_retry_at.clear)
+        resp = MagicMock(status=429)
+        self.channel.send.side_effect = discord.HTTPException(resp, "You are being blocked")
+        self.db.set_report_channel(G, 555, self.yesterday.isoformat())
+        with self.assertLogs("timerecord", "WARNING"):
+            await bot.bot.post_daily_reports()
+        self.assertEqual(self.last(), self.yesterday.isoformat())  # 未標記為已處理，重啟後也會補發
+
+        await bot.bot.post_daily_reports()  # 還沒到重試時間
+        self.channel.send.assert_called_once()
+
+        self.channel.send.side_effect = None
+        bot.bot.report_retry_at[G] = 0  # 到了重試時間
+        await bot.bot.post_daily_reports()
+        self.assertEqual(self.channel.send.call_count, 2)
+        self.assertEqual(self.last(), self.today.isoformat())
+        self.assertNotIn(G, bot.bot.report_retry_at)
+
+    async def test_server_error_and_connection_error_are_retried(self):
+        self.addCleanup(bot.bot.report_retry_at.clear)
+        self.db.set_report_channel(G, 555, None)
+        for error in (discord.HTTPException(MagicMock(status=503), "unavailable"), aiohttp.ClientOSError()):
+            bot.bot.report_retry_at.clear()
+            self.channel.send.side_effect = error
+            with self.assertLogs("timerecord", "WARNING"):
+                await bot.bot.post_daily_reports()
+            self.assertIsNone(self.last())
+            self.assertIn(G, bot.bot.report_retry_at)
 
     async def test_multiple_guilds(self):
         self.db.set_report_channel(G, 555, self.yesterday.isoformat())
