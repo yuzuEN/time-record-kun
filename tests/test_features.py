@@ -749,6 +749,7 @@ class LoginWithRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.bot.login.await_count, 4)
         waits = [c.args[0] for c in self.sleep.await_args_list]
         self.assertEqual(waits, [bot.LOGIN_RETRY_SECONDS, bot.LOGIN_RETRY_SECONDS * 2, 300])
+        bot.bot.http.close.assert_not_awaited()  # 關掉的話重試時會 "Session is closed"
 
     async def test_backoff_is_capped(self):
         bot.bot.login.side_effect = [self.rate_limited()] * 10 + [None]
