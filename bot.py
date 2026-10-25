@@ -49,6 +49,8 @@ REPORT_CATEGORIES = ("study", "work")
 CATEGORY_CHOICES =[app_commands.Choice(name=f"{e} {n}", value=k) for k, (e, n) in CATEGORIES.items()]
 # 打卡面板上的區域：類別代碼 -> 區域名稱（依按鈕順序，不含 Minecraft）
 PANEL_ZONES = {"work": "工作室", "study": "讀書室", "rest": "休息區"}
+# /add 手動補登的時段不屬於任何頻道，channel_id 存成這個值
+MANUAL_CHANNEL_ID = 0
 
 log = logging.getLogger("timerecord")
 
@@ -60,6 +62,15 @@ def cat_label(category: str) -> str:
 
 def zone_label(category: str) -> str:
     return f"{CATEGORIES[category][0]} {PANEL_ZONES.get(category, CATEGORIES[category][1])}"
+
+
+def where_label(source: str, category: str, channel_id: int) -> str:
+    """時段發生在哪裡：語音頻道顯示頻道連結，面板打卡與手動補登另外標示。"""
+    if source == "button":
+        return f"{PANEL_ZONES.get(category, category)}（面板）"
+    if source == "manual":
+        return "手動補登"
+    return f"<#{channel_id}>"
 
 
 def fmt_clock(ts: int) -> str:
@@ -425,6 +436,96 @@ async def delete_cmd(interaction: discord.Interaction, member: discord.Member, d
     )
 
 
+class ConfirmAddView(discord.ui.View):
+    def __init__(self, guild_id: int, target: discord.Member, category: str, start: int, end: int):
+        super().__init__(timeout=60)
+        self.guild_id, self.target, self.category, self.start, self.end = guild_id, target, category, start, end
+        self.interaction: Optional[discord.Interaction] = None  # 送出確認訊息的那次互動，逾時時用來編輯訊息
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.interaction:
+            try:
+                await self.interaction.edit_original_response(content="⌛ 已逾時，沒有補登任何紀錄。請重新執行 `/add`。", view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="確認補登", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        # 等待確認的期間可能有新紀錄（例如對方剛好進了語音頻道），再檢查一次
+        if bot.db.query_sessions(self.guild_id, self.target.id, self.start, self.end):
+            await interaction.response.edit_message(content="這段時間剛剛有了新的紀錄，沒有補登。請重新執行 `/add`。", view=None)
+            return
+        bot.db.add_session(
+            self.guild_id, self.target.id, MANUAL_CHANNEL_ID, self.category, self.start, self.end, source="manual"
+        )
+        log.info(
+            "%s 幫 %s 補登了 %s ~ %s 的 %s 紀錄",
+            interaction.user, self.target, self.start, self.end, self.category,
+        )
+        await interaction.response.edit_message(content=f"✅ 已補登 {fmt_duration(self.end - self.start)}。", view=None)
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="已取消，沒有補登任何紀錄。", view=None)
+
+
+@bot.tree.command(name="add", description="手動補登某成員在指定時間段的紀錄（例如機器人離線期間）")
+@app_commands.describe(
+    member="要補登紀錄的成員",
+    category="這段時間在做什麼",
+    date="開始日期，格式 YYYY-MM-DD",
+    start="開始時間，格式 HH:MM 或 HH:MM:SS",
+    end="結束時間，格式 HH:MM 或 HH:MM:SS（比開始時間早則視為隔天）",
+)
+@app_commands.choices(category=CATEGORY_CHOICES)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def add_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    category: app_commands.Choice[str],
+    date: str,
+    start: str,
+    end: str,
+):
+    try:
+        start_ts, end_ts = parse_range(date, start, end, TZ)
+    except ValueError:
+        await interaction.response.send_message("格式錯誤，或開始與結束時間相同。日期用 `YYYY-MM-DD`，時間用 `HH:MM` 或 `HH:MM:SS`，例如 `2026-10-04` `21:50:08` `21:51`", ephemeral=True)
+        return
+    if end_ts > int(time.time()):
+        await interaction.response.send_message("結束時間不能晚於現在", ephemeral=True)
+        return
+
+    overlap = bot.db.query_sessions(interaction.guild_id, member.id, start_ts, end_ts)
+    if overlap:
+        lines = [
+            f"{CATEGORIES.get(s['category'], ('❔',))[0]} {where_label(s['source'], s['category'], s['channel_id'])}　"
+            f"`{fmt_clock(s['join_ts'])} → {fmt_clock(s['leave_ts']) if s['leave_ts'] is not None else '進行中'}`"
+            for s in overlap[:10]
+        ]
+        await interaction.response.send_message(
+            f"這段時間已經有 {len(overlap)} 段紀錄，為了避免重複計算沒有補登。請縮短補登的時間，"
+            "或先用 `/delete` 刪掉這段時間的紀錄：\n" + "\n".join(lines),
+            ephemeral=True,
+        )
+        return
+
+    range_txt = f"{datetime.fromtimestamp(start_ts, TZ):%m/%d %H:%M:%S} → {datetime.fromtimestamp(end_ts, TZ):%m/%d %H:%M:%S}"
+    view = ConfirmAddView(interaction.guild_id, member, category.value, start_ts, end_ts)
+    view.interaction = interaction
+    await interaction.response.send_message(
+        f"即將幫 **{member.display_name}** 補登 `{range_txt}` 的 **{cat_label(category.value)}**，"
+        f"共 **{fmt_duration(end_ts - start_ts)}**。確定嗎？",
+        view=view,
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="channels", description="列出目前追蹤中的語音頻道")
 @app_commands.guild_only()
 async def channels_cmd(interaction: discord.Interaction):
@@ -770,7 +871,7 @@ async def log_cmd(interaction: discord.Interaction, date: Optional[str] = None, 
             leave_txt = fmt_clock(leave)
         duration = fmt_duration((leave if leave is not None else now) - s["join_ts"])
         emoji = CATEGORIES.get(s["category"], ("❔",))[0]
-        where = f"{PANEL_ZONES.get(s['category'], s['category'])}（面板）" if s["source"] == "button" else f"<#{s['channel_id']}>"
+        where = where_label(s["source"], s["category"], s["channel_id"])
         lines.append(f"{emoji} {where}　`{join_txt} → {leave_txt}`　({duration})")
 
     description = "\n".join(lines) if lines else "這天沒有任何紀錄"
@@ -805,7 +906,10 @@ async def channeltime_cmd(interaction: discord.Interaction, date: Optional[str] 
         key=lambda x: x[2],
         reverse=True,
     )
-    lines = [f"{CATEGORIES.get(cat, ('❔',))[0]} <#{cid}>　**{fmt_duration(sec)}**" for cid, cat, sec in rows]
+    lines = [
+        f"{CATEGORIES.get(cat, ('❔',))[0]} {'手動補登' if cid == MANUAL_CHANNEL_ID else f'<#{cid}>'}　**{fmt_duration(sec)}**"
+        for cid, cat, sec in rows
+    ]
     if lines:
         lines.append(f"\n⏱️ 合計 **{fmt_duration(sum(sec for _, _, sec in rows))}**")
     embed = discord.Embed(
@@ -920,7 +1024,7 @@ async def login_with_retry(token: str) -> None:
                 retry_after = 0
             wait = max(delay, retry_after)
             log.warning("登入被 Discord 限速（%s），%d 秒後重試", e.text, wait)
-            await bot.http.close()
+            # 不要關掉 bot.http：重新 login 時新的 session 會沿用同一個已關閉的 connector，變成 "Session is closed"
             await asyncio.sleep(wait)
             delay = min(delay * 2, LOGIN_RETRY_MAX_SECONDS)
 

@@ -19,6 +19,7 @@
 - **CSV 匯出**：匯出原始紀錄，可以用 Excel 或 Google 試算表做進一步分析。
 - **跨日自動切割**：從 23:00 讀到隔天 01:30，會拆成前一天 1 小時、隔天 1.5 小時。
 - **停機補償**：機器人重新啟動時會自動校正離線期間的進出狀態。
+- **手動補登與刪除**：管理員可以補登機器人離線期間的時數，或刪除忘記退出語音頻道的時數。
 
 ---
 
@@ -40,7 +41,7 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 資料存在單一個 SQLite 檔案（預設 `timerecord.db`），主要的表有：
 
 - **`channel_map`**：記錄每個伺服器中「哪個語音頻道屬於哪一類」。
-- **`sessions`**：每一次待在追蹤頻道的時段，內容是 `user_id`、`channel_id`、`category`、`join_ts`（進入時間）、`leave_ts`（離開時間，還沒離開則為 `NULL`）、`source`（`voice` 是語音頻道，`button` 是打卡面板）。時間一律存成 Unix timestamp（UTC 秒數）。
+- **`sessions`**：每一次待在追蹤頻道的時段，內容是 `user_id`、`channel_id`、`category`、`join_ts`（進入時間）、`leave_ts`（離開時間，還沒離開則為 `NULL`）、`source`（`voice` 是語音頻道，`button` 是打卡面板，`manual` 是用 `/add` 手動補登，`channel_id` 為 `0`）。時間一律存成 Unix timestamp（UTC 秒數）。
 - **`panels`**：每個伺服器打卡面板訊息的位置，用來更新面板上的名單。
 - **`meta`**：存放機器人「最後存活時間」等內部資訊。
 
@@ -57,7 +58,7 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 1. 找出所有尚未結束的時段，如果那個人**已經不在該頻道**，就用上次的最後存活時間當作離開時間（誤差最多 1 分鐘）。
 2. 如果有人**現在已經在追蹤頻道裡**但沒有對應的時段，就從現在開始記錄。
 
-> ⚠️ 機器人離線期間無法得知確切的進出時間，所以停機越久，這段期間的紀錄就越不精確。建議讓機器人 24 小時運作。
+> ⚠️ 機器人離線期間無法得知確切的進出時間（Discord 不提供查詢過去進出紀錄的 API），所以停機越久，這段期間的紀錄就越不精確：離線期間才進入的人從機器人上線時才開始計時，離線期間進去又出來的則完全不會記到。建議讓機器人 24 小時運作；漏記的時數可以由管理員用 `/add` 補登。
 
 ---
 
@@ -100,6 +101,7 @@ Discord 在成員的語音狀態改變時，會透過 Gateway 送出 `VOICE_STAT
 | `/setup channel category` | 把語音頻道設為某一類（管理員） | `/setup channel:#讀書室 category:📚 讀書` |
 | `/unset channel` | 停止追蹤某頻道（管理員） | `/unset channel:#讀書室` |
 | `/delete member date start end` | 刪除某成員在指定時間段的紀錄，例如忘記退出語音頻道（管理員，會先確認）。時間可用 `HH:MM` 或 `HH:MM:SS`，結束早於開始視為隔天 | `/delete member:@小明 date:2026-10-04 start:23:00 end:08:30` |
+| `/add member category date start end` | 手動補登某成員在指定時間段的紀錄，例如機器人離線期間（管理員，會先確認）。和現有紀錄重疊時會拒絕，避免重複計算 | `/add member:@小明 category:📚 讀書 date:2026-10-25 start:07:00 end:08:40` |
 | `/privacy [mode]` | 設定能不能查詢別人的時間；不填則顯示目前設定（管理員） | `/privacy mode:🔒 私人` |
 | `/report set channel [time]` | 每天在指定時間（預設 00:00）於該頻道公告前一天的排行榜；可選文字、公告或論壇頻道（管理員） | `/report set channel:#公告 time:08:00` |
 | `/report off` | 關閉每日排行榜公告（管理員） | `/report off` |
@@ -247,6 +249,9 @@ discordTimeRecord/
 
 **Q：電腦關機後資料會消失嗎？**
 不會。資料都存在 `timerecord.db` 裡。不過機器人沒有執行的期間無法記錄進出。如果希望 24 小時記錄，可以把機器人放在雲端主機、樹莓派或 NAS 上執行。
+
+**Q：機器人離線期間的時數可以補回來嗎？**
+無法自動補回，但管理員可以用 `/add` 手動補登。補登的時段會照常計入 `/today`、`/stats`、`/leaderboard` 和每日排行榜，在 `/log` 和 `/channeltime` 中顯示為「手動補登」。如果補登的是前一天、每日排行榜已經公告過了，可以用 `/report post` 重新發佈。
 
 **Q：log 出現 `429 Too Many Requests ... You are being blocked from accessing our API temporarily`？**
 這是 Discord 暫時封鎖了主機的 IP，常發生在 Railway 這類多人共用 IP 的平台上（其他人的程式送出太多請求，大家一起被擋）。程式碼沒辦法解除封鎖，通常幾十分鐘到一小時內會自動解除。機器人登入時遇到這個錯誤會自己等待後重試（從 60 秒開始，每次加倍，最多 30 分鐘），不會一直重啟；每日排行榜也會自動補發。如果常常發生，可以考慮換到有獨立 IP 的主機（例如 VPS）。

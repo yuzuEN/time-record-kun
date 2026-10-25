@@ -106,6 +106,16 @@ class Database:
             (guild_id, user_id, channel_id, category, ts, source),
         )
 
+    def add_session(
+        self, guild_id: int, user_id: int, channel_id: int, category: str, join_ts: int, leave_ts: int, source: str
+    ) -> None:
+        """新增一段已經結束的時段（手動補登用）。"""
+        self._exec(
+            "INSERT INTO sessions (guild_id, user_id, channel_id, category, join_ts, leave_ts, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, channel_id, category, join_ts, leave_ts, source),
+        )
+
     def close_user_sessions(self, guild_id: int, user_id: int, ts: int, source: Optional[str] = None) -> int:
         """結束某使用者在該伺服器所有尚未結束的時段；指定 source 時只結束該來源的時段。回傳結束的時段數。"""
         cur = self._exec(
