@@ -148,6 +148,14 @@ class Database:
             (guild_id, user_id),
         ).fetchone()
 
+    def get_last_leave_ts(self, guild_id: int, user_id: int) -> Optional[int]:
+        """某使用者最近一次結束時段的時間；沒有紀錄時回傳 None。"""
+        row = self.conn.execute(
+            "SELECT MAX(leave_ts) AS last FROM sessions WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ).fetchone()
+        return row["last"]
+
     def get_guild_open_sessions(self, guild_id: int) -> List[sqlite3.Row]:
         """伺服器目前所有計時中的時段（語音頻道與打卡面板），先開始的排前面。"""
         return self.conn.execute(

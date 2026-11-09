@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -42,7 +42,15 @@ NUDGE_COOLDOWN_SECONDS = 5 * 60
 NUDGE_DELETE_AFTER_SECONDS = 60 * 60
 # 催讀書文字裡的這個標記會換成對方已經休息多久
 NUDGE_TIME_PLACEHOLDER = "{時間}"
-NUDGE_DEFAULT_TEXT = f"你已經休息 {NUDGE_TIME_PLACEHOLDER} 了！還不讀書嗎"
+# 催讀書的預設文字依對方目前的狀態而定；沒列出的類別會用「你已經<類別名稱> {時間} 了！還不讀書嗎」
+NUDGE_CATEGORY_TEXTS = {
+    "study": f"你已經讀書 {NUDGE_TIME_PLACEHOLDER} 了！繼續加油，不要停",
+    "minecraft": f"你已經玩 Minecraft {NUDGE_TIME_PLACEHOLDER} 了！還不讀書嗎",
+}
+NUDGE_LEFT_TEXT = f"你已經離開 {NUDGE_TIME_PLACEHOLDER} 了！還不讀書嗎"
+NUDGE_NO_TIME_TEXT = "你現在沒有在計時！還不讀書嗎"
+# 不知道對方的時間時，自訂文字裡的標記換成這個
+NUDGE_UNKNOWN_TIME = "一段時間"
 NUDGE_MAX_LENGTH = 200
 
 # 類別代碼 -> (emoji, 顯示名稱)
@@ -148,7 +156,7 @@ def build_panel_embed(db: Database, guild_id: int) -> discord.Embed:
         title="⏱️ 打卡面板",
         description="按下按鈕進入區域開始計時，換區直接按另一個，結束時按「離開」。\n"
                     "再按一次目前所在的區域可以查看已經待了多久。🎧 表示在語音頻道裡。\n"
-                    "看到有人休息太久？按「催讀書」選擇成員，機器人會 @ 對方。",
+                    "想提醒別人讀書？按「催讀書」選擇成員，機器人會 @ 對方。",
         color=0x5865F2,
     )
     sessions = db.get_guild_open_sessions(guild_id)
@@ -726,11 +734,26 @@ async def panel_leave(interaction: discord.Interaction):
     await bot.refresh_panel(guild_id)
 
 
+def nudge_status(guild_id: int, user_id: int, now: int) -> Tuple[str, Optional[int]]:
+    """依對方目前的狀態回傳 (預設文字, 這個狀態持續的秒數)；秒數未知時為 None。"""
+    current = bot.db.get_open_session(guild_id, user_id)
+    if current is not None:
+        category = current["category"]
+        name = CATEGORIES.get(category, ("", category))[1]
+        text = NUDGE_CATEGORY_TEXTS.get(category, f"你已經{name} {NUDGE_TIME_PLACEHOLDER} 了！還不讀書嗎")
+        return text, now - current["join_ts"]
+    # 正在計時的人本來就列在面板上，但上次離開的時間只有查詢紀錄才看得到，私人模式下不公開
+    if bot.db.get_privacy(guild_id) == "public":
+        left = bot.db.get_last_leave_ts(guild_id, user_id)
+        if left is not None:
+            return NUDGE_LEFT_TEXT, max(now - left, 0)
+    return NUDGE_NO_TIME_TEXT, None
+
+
 def nudge_blocked_reason(guild_id: int, target: Union[discord.Member, discord.User], now: int) -> Optional[str]:
     """現在不能催這個人的原因；可以催時回傳 None。"""
-    current = bot.db.get_open_session(guild_id, target.id)
-    if current is None or current["category"] != "rest":
-        return f"**{target.display_name}** 現在沒有在休息，不用催。"
+    if target.bot:
+        return f"**{target.display_name}** 是機器人，不用讀書。"
     wait = bot.nudged_at.get((guild_id, target.id), 0) + NUDGE_COOLDOWN_SECONDS - now
     if wait > 0:
         return f"**{target.display_name}** 剛剛才被催過，{fmt_duration(wait)} 後才能再催一次。"
@@ -740,17 +763,18 @@ def nudge_blocked_reason(guild_id: int, target: Union[discord.Member, discord.Us
 async def send_nudge(
     interaction: discord.Interaction, target: Union[discord.Member, discord.User], custom_text: Optional[str] = None
 ) -> None:
-    """在這個頻道 @ 正在休息的成員，並把選單改成結果。custom_text 是自訂文字，None 表示用預設文字。"""
+    """在這個頻道 @ 指定的成員，並把選單改成結果。custom_text 是自訂文字，None 表示用預設文字。"""
     guild_id = interaction.guild_id
     now = int(time.time())
-    # 選文字的期間對方可能已經不休息，或被別人催過，送出前再檢查一次
+    # 選文字的期間對方可能已經被別人催過，送出前再檢查一次
     reason = nudge_blocked_reason(guild_id, target, now)
     if reason:
         await interaction.response.edit_message(content=reason, view=None)
         return
 
-    rested = fmt_duration(now - bot.db.get_open_session(guild_id, target.id)["join_ts"])
-    text = (custom_text or NUDGE_DEFAULT_TEXT).replace(NUDGE_TIME_PLACEHOLDER, rested)
+    default_text, seconds = nudge_status(guild_id, target.id, now)
+    elapsed = NUDGE_UNKNOWN_TIME if seconds is None else fmt_duration(seconds)
+    text = (custom_text or default_text).replace(NUDGE_TIME_PLACEHOLDER, elapsed)
     content = f"{target.mention} {text}"
     if custom_text:
         content += f"\n— {interaction.user.mention}"  # 自訂文字標註是誰寫的；不會 @ 到對方以外的人
@@ -774,15 +798,15 @@ async def send_nudge(
 
 class NudgeTextModal(discord.ui.Modal, title="自訂催讀書文字"):
     text = discord.ui.TextInput(
-        label=f"訊息內容（{NUDGE_TIME_PLACEHOLDER} 會換成休息時間）",
+        label=f"訊息內容（{NUDGE_TIME_PLACEHOLDER} 會換成對方的時間）",
         style=discord.TextStyle.paragraph,
-        default=NUDGE_DEFAULT_TEXT,
         max_length=NUDGE_MAX_LENGTH,
     )
 
-    def __init__(self, target: Union[discord.Member, discord.User], parent: "NudgeTextView"):
+    def __init__(self, target: Union[discord.Member, discord.User], parent: "NudgeTextView", default_text: str):
         super().__init__(timeout=300)
         self.target, self.parent = target, parent
+        self.text.default = default_text
 
     async def on_submit(self, interaction: discord.Interaction):
         self.parent.stop()
@@ -812,7 +836,8 @@ class NudgeTextView(discord.ui.View):
     @discord.ui.button(label="自訂文字", emoji="✏️", style=discord.ButtonStyle.secondary)
     async def use_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
         # 輸入框可能被按掉，所以這裡不結束 view，還可以改按預設文字
-        await interaction.response.send_modal(NudgeTextModal(self.target, self))
+        default_text, _ = nudge_status(interaction.guild_id, self.target.id, int(time.time()))
+        await interaction.response.send_modal(NudgeTextModal(self.target, self, default_text))
 
 
 class NudgeView(discord.ui.View):
@@ -833,13 +858,16 @@ class NudgeView(discord.ui.View):
     async def pick(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         self.stop()
         target = select.values[0]
-        reason = nudge_blocked_reason(interaction.guild_id, target, int(time.time()))
+        now = int(time.time())
+        reason = nudge_blocked_reason(interaction.guild_id, target, now)
         if reason:
             await interaction.response.edit_message(content=reason, view=None)
             return
         view = NudgeTextView(target)
         view.interaction = interaction
-        preview = NUDGE_DEFAULT_TEXT.replace(NUDGE_TIME_PLACEHOLDER, "（休息時間）")
+        default_text, seconds = nudge_status(interaction.guild_id, target.id, now)
+        elapsed = NUDGE_UNKNOWN_TIME if seconds is None else fmt_duration(seconds)
+        preview = default_text.replace(NUDGE_TIME_PLACEHOLDER, elapsed)
         await interaction.response.edit_message(
             content=f"要用什麼文字提醒 **{target.display_name}**？\n預設文字：{preview}", view=view
         )

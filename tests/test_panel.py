@@ -200,6 +200,7 @@ class NudgeTest(PanelBotTestCase):
         self.target.id = OTHER
         self.target.mention = f"<@{OTHER}>"
         self.target.display_name = "小明"
+        self.target.bot = False
 
     def make_it(self):
         it = make_interaction()
@@ -226,14 +227,46 @@ class NudgeTest(PanelBotTestCase):
         await bot.send_nudge(it, self.target)
         it.channel.send.assert_awaited_once()
 
-    async def test_not_resting_is_not_sent(self):
-        self.db.open_session(G, OTHER, PANEL_CH, "study", T0, source="button")
-        for _ in range(2):  # 第二次是連時段都沒有的情況
-            it = self.make_it()
-            await bot.send_nudge(it, self.target)
-            it.channel.send.assert_not_awaited()
-            self.assertIn("沒有在休息", self.result(it))
-            self.db.close_user_sessions(G, OTHER, T0 + 1)
+    async def sent_text(self, custom_text=None):
+        it = self.make_it()
+        it.user.mention = f"<@{ME}>"
+        await bot.send_nudge(it, self.target, custom_text)
+        return it.channel.send.call_args.args[0]
+
+    async def test_default_text_follows_member_status(self):
+        for category, expected in (
+            ("work", "你已經工作 10m00s 了！還不讀書嗎"),
+            ("study", "你已經讀書 10m00s 了！繼續加油，不要停"),
+            ("minecraft", "你已經玩 Minecraft 10m00s 了！還不讀書嗎"),
+        ):
+            with self.subTest(category):
+                self.db.open_session(G, OTHER, PANEL_CH, category, T0, source="button")
+                self.assertEqual(await self.sent_text(), f"<@{OTHER}> {expected}")
+                self.db.close_user_sessions(G, OTHER, T0)
+                bot.bot.nudged_at.clear()
+
+    async def test_member_with_no_records_can_be_nudged(self):
+        self.assertEqual(await self.sent_text(), f"<@{OTHER}> 你現在沒有在計時！還不讀書嗎")
+
+    async def test_member_not_timing_shows_time_since_last_leave(self):
+        self.db.add_session(G, OTHER, 0, "study", T0 - 100, T0 - 60, source="manual")
+        self.db.add_session(G, OTHER, 0, "study", T0 - 500, T0 - 400, source="manual")
+        self.db.add_session(G + 1, OTHER, 0, "study", T0, T0 + 500, source="manual")  # 別的伺服器不算
+        self.assertEqual(await self.sent_text(), f"<@{OTHER}> 你已經離開 11m00s 了！還不讀書嗎")
+
+    async def test_private_mode_hides_last_leave_time(self):
+        self.db.add_session(G, OTHER, 0, "study", T0 - 100, T0 - 60, source="manual")
+        self.db.set_privacy(G, "private")
+        self.assertEqual(await self.sent_text(), f"<@{OTHER}> 你現在沒有在計時！還不讀書嗎")
+        bot.bot.nudged_at.clear()
+        self.assertIn("回來，已經一段時間了", await self.sent_text("回來，已經{時間}了"))
+
+    async def test_bot_cannot_be_nudged(self):
+        self.target.bot = True
+        it = self.make_it()
+        await bot.send_nudge(it, self.target)
+        it.channel.send.assert_not_awaited()
+        self.assertIn("機器人", self.result(it))
 
     async def test_cooldown_blocks_second_nudge_until_it_expires(self):
         self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
@@ -273,16 +306,18 @@ class NudgeTest(PanelBotTestCase):
         await select.callback(it)
         return it
 
-    async def test_picking_resting_member_asks_which_text(self):
-        self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
+    async def test_picking_member_previews_status_text_and_asks_which_text(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "study", T0, source="button")
         it = await self.pick_target()
         kwargs = it.response.edit_message.call_args.kwargs
         self.assertIsInstance(kwargs["view"], bot.NudgeTextView)
+        self.assertIn("你已經讀書 10m00s 了", kwargs["content"])
         it.channel.send.assert_not_awaited()
 
-    async def test_picking_member_not_resting_stops_early(self):
+    async def test_picking_bot_stops_early(self):
+        self.target.bot = True
         it = await self.pick_target()
-        self.assertIn("沒有在休息", self.result(it))
+        self.assertIn("機器人", self.result(it))
         self.assertIsNone(it.response.edit_message.call_args.kwargs["view"])
 
     async def test_default_button_sends_default_text(self):
@@ -294,19 +329,20 @@ class NudgeTest(PanelBotTestCase):
         self.assertTrue(view.is_finished())
 
     async def test_custom_button_opens_prefilled_modal_and_keeps_view_alive(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "work", T0, source="button")
         view = bot.NudgeTextView(self.target)
         it = self.make_it()
         it.response.send_modal = AsyncMock()
         await view.children[1].callback(it)
         modal = it.response.send_modal.call_args.args[0]
         self.assertIsInstance(modal, bot.NudgeTextModal)
-        self.assertEqual(modal.text.default, bot.NUDGE_DEFAULT_TEXT)
+        self.assertEqual(modal.text.default, "你已經工作 {時間} 了！還不讀書嗎")
         self.assertFalse(view.is_finished())
 
     async def submit_modal(self, value):
         self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
         view = bot.NudgeTextView(self.target)
-        modal = bot.NudgeTextModal(self.target, view)
+        modal = bot.NudgeTextModal(self.target, view, "預設")
         modal.text._value = value
         it = self.make_it()
         it.user.mention = f"<@{ME}>"
@@ -330,14 +366,15 @@ class NudgeTest(PanelBotTestCase):
         it = await self.submit_modal("   ")
         self.assertEqual(it.channel.send.call_args.args[0], f"<@{OTHER}> 你已經休息 10m00s 了！還不讀書嗎")
 
-    async def test_rechecks_rest_when_custom_text_is_submitted(self):
+    async def test_rechecks_cooldown_when_custom_text_is_submitted(self):
         view = bot.NudgeTextView(self.target)
-        modal = bot.NudgeTextModal(self.target, view)  # 打字期間對方已經離開休息區
+        modal = bot.NudgeTextModal(self.target, view, "預設")
         modal.text._value = "回來"
+        bot.bot.nudged_at[(G, OTHER)] = self.now  # 打字期間別人先催了
         it = self.make_it()
         await modal.on_submit(it)
         it.channel.send.assert_not_awaited()
-        self.assertIn("沒有在休息", self.result(it))
+        self.assertIn("剛剛才被催過", self.result(it))
 
 
 class VoicePriorityTest(PanelBotTestCase):
