@@ -36,6 +36,14 @@ REPORT_RETRY_SECONDS = 15 * 60
 # 登入被 Discord 限速（429）時，第一次等多久再試，之後每次加倍，最多等到 LOGIN_RETRY_MAX_SECONDS
 LOGIN_RETRY_SECONDS = 60
 LOGIN_RETRY_MAX_SECONDS = 30 * 60
+# 同一個人被「催讀書」後，多久內不能再被催，避免有人一直按按鈕洗 @
+NUDGE_COOLDOWN_SECONDS = 5 * 60
+# 催讀書的訊息多久後自動刪除，讓打卡面板不會被訊息推上去
+NUDGE_DELETE_AFTER_SECONDS = 60 * 60
+# 催讀書文字裡的這個標記會換成對方已經休息多久
+NUDGE_TIME_PLACEHOLDER = "{時間}"
+NUDGE_DEFAULT_TEXT = f"你已經休息 {NUDGE_TIME_PLACEHOLDER} 了！還不讀書嗎"
+NUDGE_MAX_LENGTH = 200
 
 # 類別代碼 -> (emoji, 顯示名稱)
 CATEGORIES = {
@@ -44,8 +52,9 @@ CATEGORIES = {
     "work": ("💼", "工作"),
     "minecraft": ("⛏️", "Minecraft"),
 }
-# 每日排行榜只計算這些類別的時數
+# 每日排行榜與各統計的「合計」只計算這些類別的時數（休息、Minecraft 只單獨列出，不計入合計）
 REPORT_CATEGORIES = ("study", "work")
+TOTAL_LABEL = "⏱️ 合計（讀書＋工作）"
 CATEGORY_CHOICES =[app_commands.Choice(name=f"{e} {n}", value=k) for k, (e, n) in CATEGORIES.items()]
 # 打卡面板上的區域：類別代碼 -> 區域名稱（依按鈕順序，不含 Minecraft）
 PANEL_ZONES = {"work": "工作室", "study": "讀書室", "rest": "休息區"}
@@ -62,6 +71,11 @@ def cat_label(category: str) -> str:
 
 def zone_label(category: str) -> str:
     return f"{CATEGORIES[category][0]} {PANEL_ZONES.get(category, CATEGORIES[category][1])}"
+
+
+def counted_total(totals: dict) -> int:
+    """{類別: 秒數} 中計入合計的秒數。"""
+    return sum(totals.get(cat, 0) for cat in REPORT_CATEGORIES)
 
 
 def where_label(source: str, category: str, channel_id: int) -> str:
@@ -133,7 +147,8 @@ def build_panel_embed(db: Database, guild_id: int) -> discord.Embed:
     embed = discord.Embed(
         title="⏱️ 打卡面板",
         description="按下按鈕進入區域開始計時，換區直接按另一個，結束時按「離開」。\n"
-                    "再按一次目前所在的區域可以查看已經待了多久。🎧 表示在語音頻道裡。",
+                    "再按一次目前所在的區域可以查看已經待了多久。🎧 表示在語音頻道裡。\n"
+                    "看到有人休息太久？按「催讀書」選擇成員，機器人會 @ 對方。",
         color=0x5865F2,
     )
     sessions = db.get_guild_open_sessions(guild_id)
@@ -173,6 +188,7 @@ class TimeRecordBot(commands.Bot):
         self.report_retry_at = {}  # guild_id -> 每日排行榜下次可以重試的時間
         self.panel_refreshed_at = {}  # guild_id -> 打卡面板上次更新的時間（time.monotonic）
         self.panel_refresh_tasks = {}  # guild_id -> 等待中的面板更新
+        self.nudged_at = {}  # (guild_id, user_id) -> 上次被催讀書的時間
 
     async def setup_hook(self):
         if GUILD_ID:
@@ -249,7 +265,8 @@ class TimeRecordBot(commands.Bot):
         self.panel_refreshed_at[guild_id] = time.monotonic()
         message = self.get_partial_messageable(panel["channel_id"]).get_partial_message(panel["message_id"])
         try:
-            await message.edit(embed=build_panel_embed(self.db, guild_id))
+            # 連按鈕一起更新，舊版發佈的面板不用重新 /panel 也會出現新按鈕
+            await message.edit(embed=build_panel_embed(self.db, guild_id), view=PanelView())
         except discord.NotFound:
             self.db.clear_panel(guild_id)  # 面板訊息被刪掉了
         except discord.HTTPException:
@@ -709,6 +726,131 @@ async def panel_leave(interaction: discord.Interaction):
     await bot.refresh_panel(guild_id)
 
 
+def nudge_blocked_reason(guild_id: int, target: Union[discord.Member, discord.User], now: int) -> Optional[str]:
+    """現在不能催這個人的原因；可以催時回傳 None。"""
+    current = bot.db.get_open_session(guild_id, target.id)
+    if current is None or current["category"] != "rest":
+        return f"**{target.display_name}** 現在沒有在休息，不用催。"
+    wait = bot.nudged_at.get((guild_id, target.id), 0) + NUDGE_COOLDOWN_SECONDS - now
+    if wait > 0:
+        return f"**{target.display_name}** 剛剛才被催過，{fmt_duration(wait)} 後才能再催一次。"
+    return None
+
+
+async def send_nudge(
+    interaction: discord.Interaction, target: Union[discord.Member, discord.User], custom_text: Optional[str] = None
+) -> None:
+    """在這個頻道 @ 正在休息的成員，並把選單改成結果。custom_text 是自訂文字，None 表示用預設文字。"""
+    guild_id = interaction.guild_id
+    now = int(time.time())
+    # 選文字的期間對方可能已經不休息，或被別人催過，送出前再檢查一次
+    reason = nudge_blocked_reason(guild_id, target, now)
+    if reason:
+        await interaction.response.edit_message(content=reason, view=None)
+        return
+
+    rested = fmt_duration(now - bot.db.get_open_session(guild_id, target.id)["join_ts"])
+    text = (custom_text or NUDGE_DEFAULT_TEXT).replace(NUDGE_TIME_PLACEHOLDER, rested)
+    content = f"{target.mention} {text}"
+    if custom_text:
+        content += f"\n— {interaction.user.mention}"  # 自訂文字標註是誰寫的；不會 @ 到對方以外的人
+
+    key = (guild_id, target.id)
+    bot.nudged_at[key] = now  # 送出前先記下，同時有人按的話只會發一則
+    try:
+        await interaction.channel.send(
+            content,
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[target]),
+            delete_after=NUDGE_DELETE_AFTER_SECONDS,
+        )
+    except discord.HTTPException:
+        bot.nudged_at.pop(key, None)
+        log.exception("無法在頻道 %s 發送催讀書訊息", interaction.channel_id)
+        await interaction.response.edit_message(content="訊息發送失敗，請檢查機器人在這個頻道的權限。", view=None)
+        return
+    log.info("%s 催 %s 讀書（伺服器 %s）：%s", interaction.user, target, guild_id, text)
+    await interaction.response.edit_message(content=f"📣 已提醒 **{target.display_name}**。", view=None)
+
+
+class NudgeTextModal(discord.ui.Modal, title="自訂催讀書文字"):
+    text = discord.ui.TextInput(
+        label=f"訊息內容（{NUDGE_TIME_PLACEHOLDER} 會換成休息時間）",
+        style=discord.TextStyle.paragraph,
+        default=NUDGE_DEFAULT_TEXT,
+        max_length=NUDGE_MAX_LENGTH,
+    )
+
+    def __init__(self, target: Union[discord.Member, discord.User], parent: "NudgeTextView"):
+        super().__init__(timeout=300)
+        self.target, self.parent = target, parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent.stop()
+        await send_nudge(interaction, self.target, self.text.value.strip() or None)
+
+
+class NudgeTextView(discord.ui.View):
+    """選好成員後，選擇要用預設文字還是自訂文字。"""
+
+    def __init__(self, target: Union[discord.Member, discord.User]):
+        super().__init__(timeout=300)
+        self.target = target
+        self.interaction: Optional[discord.Interaction] = None  # 顯示這些按鈕的那次互動，逾時時用來編輯訊息
+
+    async def on_timeout(self):
+        if self.interaction:
+            try:
+                await self.interaction.edit_original_response(content="⌛ 已逾時，請重新按「催讀書」。", view=None)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="發送預設文字", emoji="📣", style=discord.ButtonStyle.primary)
+    async def use_default(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await send_nudge(interaction, self.target)
+
+    @discord.ui.button(label="自訂文字", emoji="✏️", style=discord.ButtonStyle.secondary)
+    async def use_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 輸入框可能被按掉，所以這裡不結束 view，還可以改按預設文字
+        await interaction.response.send_modal(NudgeTextModal(self.target, self))
+
+
+class NudgeView(discord.ui.View):
+    """按下面板的「催讀書」後只有本人看得到的成員選單。"""
+
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.interaction: Optional[discord.Interaction] = None  # 送出選單的那次互動，逾時時用來編輯訊息
+
+    async def on_timeout(self):
+        if self.interaction:
+            try:
+                await self.interaction.edit_original_response(content="⌛ 已逾時，請重新按「催讀書」。", view=None)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="選擇要提醒的成員")
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        self.stop()
+        target = select.values[0]
+        reason = nudge_blocked_reason(interaction.guild_id, target, int(time.time()))
+        if reason:
+            await interaction.response.edit_message(content=reason, view=None)
+            return
+        view = NudgeTextView(target)
+        view.interaction = interaction
+        preview = NUDGE_DEFAULT_TEXT.replace(NUDGE_TIME_PLACEHOLDER, "（休息時間）")
+        await interaction.response.edit_message(
+            content=f"要用什麼文字提醒 **{target.display_name}**？\n預設文字：{preview}", view=view
+        )
+
+
+async def panel_nudge(interaction: discord.Interaction):
+    view = NudgeView()
+    view.interaction = interaction
+    await interaction.response.send_message("要提醒誰讀書？", view=view, ephemeral=True)
+
+
 class PanelView(discord.ui.View):
     """打卡面板的按鈕。custom_id 固定，所以機器人重啟後舊面板上的按鈕仍然有效。"""
 
@@ -723,6 +865,9 @@ class PanelView(discord.ui.View):
         leave = discord.ui.Button(label="離開", emoji="🚪", style=discord.ButtonStyle.secondary, custom_id="panel:leave")
         leave.callback = panel_leave
         self.add_item(leave)
+        nudge = discord.ui.Button(label="催讀書", emoji="📣", style=discord.ButtonStyle.secondary, custom_id="panel:nudge")
+        nudge.callback = panel_nudge
+        self.add_item(nudge)
 
 
 @bot.tree.command(name="panel", description="在這個頻道發佈打卡面板，按按鈕就能開始工作/讀書/休息計時")
@@ -783,7 +928,7 @@ async def today_cmd(interaction: discord.Interaction, member: Optional[discord.M
     embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
     for cat in CATEGORIES:
         embed.add_field(name=cat_label(cat), value=fmt_duration(totals.get(cat, 0)), inline=True)
-    embed.add_field(name="⏱️ 合計", value=fmt_duration(sum(totals.values())), inline=False)
+    embed.add_field(name=TOTAL_LABEL, value=fmt_duration(counted_total(totals)), inline=False)
 
     current = bot.db.get_open_session(interaction.guild_id, target.id)
     if current:
@@ -836,7 +981,7 @@ async def stats_cmd(interaction: discord.Interaction, days: app_commands.Range[i
             value=f"{fmt_duration(grand[cat])}\n日均 {fmt_duration(grand[cat] // days)}",
             inline=True,
         )
-    embed.add_field(name="⏱️ 合計", value=fmt_duration(sum(grand.values())), inline=False)
+    embed.add_field(name=TOTAL_LABEL, value=fmt_duration(counted_total(grand)), inline=False)
     await interaction.response.send_message(embed=embed)
 
 
@@ -911,7 +1056,8 @@ async def channeltime_cmd(interaction: discord.Interaction, date: Optional[str] 
         for cid, cat, sec in rows
     ]
     if lines:
-        lines.append(f"\n⏱️ 合計 **{fmt_duration(sum(sec for _, _, sec in rows))}**")
+        counted = sum(sec for _, cat, sec in rows if cat in REPORT_CATEGORIES)
+        lines.append(f"\n{TOTAL_LABEL} **{fmt_duration(counted)}**")
     embed = discord.Embed(
         title=f"🎧 {fmt_date(day)} 各頻道時間",
         description="\n".join(lines) if lines else "這天沒有任何紀錄",

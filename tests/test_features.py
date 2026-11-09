@@ -256,9 +256,31 @@ class ChannelTimeTest(BotTestCase):
             f"📚 <#{CH_STUDY}>　**15m00s**",
             f"📚 <#{CH_STUDY2}>　**1m00s**",
             "",
-            "⏱️ 合計 **46m00s**",
+            "⏱️ 合計（讀書＋工作） **16m00s**",  # 休息的 30m 列出來但不計入
         ])
         self.assertIn(f"{self.yesterday:%m/%d}", embed.title)
+
+    async def test_today_and_stats_total_only_study_and_work(self):
+        # 把現在固定在今天中午，測試不會因為剛好跨午夜而失敗
+        now = bot.day_start_ts(bot.local_now().date(), bot.TZ) + 12 * 3600
+        p = patch.object(bot.time, "time", return_value=now)
+        p.start()
+        self.addCleanup(p.stop)
+        add(self.db, ME, CH_STUDY, "study", now - 400, now - 300)
+        add(self.db, ME, CH_STUDY, "work", now - 300, now - 250)
+        add(self.db, ME, CH_REST, "rest", now - 250, now - 100)
+        add(self.db, ME, CH_REST, "minecraft", now - 100, now - 50)
+
+        it = make_interaction(make_member(ME))
+        await bot.today_cmd.callback(it, member=None)
+        fields = {f.name: f.value for f in sent(it)[1]["embed"].fields}
+        self.assertEqual(fields[bot.TOTAL_LABEL], "2m30s")
+        self.assertEqual(fields["☕ 休息"], "2m30s")  # 休息還是單獨列出
+
+        it = make_interaction(make_member(ME))
+        await bot.stats_cmd.callback(it, days=1, member=None)
+        fields = {f.name: f.value for f in sent(it)[1]["embed"].fields}
+        self.assertEqual(fields[bot.TOTAL_LABEL], "2m30s")
 
     async def test_session_crossing_midnight_is_split(self):
         # 前天 23:00 到昨天 01:00，只算昨天的 1 小時

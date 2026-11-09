@@ -177,7 +177,10 @@ class PanelViewTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(view.is_persistent())
         self.assertEqual(
             [(b.custom_id, b.label) for b in view.children],
-            [("panel:work", "工作室"), ("panel:study", "讀書室"), ("panel:rest", "休息區"), ("panel:leave", "離開")],
+            [
+                ("panel:work", "工作室"), ("panel:study", "讀書室"), ("panel:rest", "休息區"),
+                ("panel:leave", "離開"), ("panel:nudge", "催讀書"),
+            ],
         )
 
     async def test_zone_button_dispatches_its_category(self):
@@ -185,6 +188,156 @@ class PanelViewTest(unittest.IsolatedAsyncioTestCase):
             it = make_interaction()
             await bot.PanelView().children[1].callback(it)
             enter.assert_awaited_once_with(it, "study")
+
+
+class NudgeTest(PanelBotTestCase):
+    def setUp(self):
+        super().setUp()
+        p = patch.object(bot.bot, "nudged_at", {})
+        p.start()
+        self.addCleanup(p.stop)
+        self.target = MagicMock()
+        self.target.id = OTHER
+        self.target.mention = f"<@{OTHER}>"
+        self.target.display_name = "小明"
+
+    def make_it(self):
+        it = make_interaction()
+        it.channel.send = AsyncMock()
+        it.response.edit_message = AsyncMock()
+        return it
+
+    def result(self, it):
+        return it.response.edit_message.call_args.kwargs["content"]
+
+    async def test_mentions_resting_member_with_rest_duration(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
+        it = self.make_it()
+        await bot.send_nudge(it, self.target)
+        args, kwargs = it.channel.send.call_args
+        self.assertEqual(args[0], f"<@{OTHER}> 你已經休息 10m00s 了！還不讀書嗎")
+        self.assertEqual(kwargs["allowed_mentions"].users, [self.target])
+        self.assertEqual(kwargs["delete_after"], bot.NUDGE_DELETE_AFTER_SECONDS)
+        self.assertIn("已提醒", self.result(it))
+
+    async def test_voice_rest_counts_too(self):
+        self.db.open_session(G, OTHER, VOICE_CH, "rest", T0)
+        it = self.make_it()
+        await bot.send_nudge(it, self.target)
+        it.channel.send.assert_awaited_once()
+
+    async def test_not_resting_is_not_sent(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "study", T0, source="button")
+        for _ in range(2):  # 第二次是連時段都沒有的情況
+            it = self.make_it()
+            await bot.send_nudge(it, self.target)
+            it.channel.send.assert_not_awaited()
+            self.assertIn("沒有在休息", self.result(it))
+            self.db.close_user_sessions(G, OTHER, T0 + 1)
+
+    async def test_cooldown_blocks_second_nudge_until_it_expires(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
+        await bot.send_nudge(self.make_it(), self.target)
+
+        it = self.make_it()
+        await bot.send_nudge(it, self.target)
+        it.channel.send.assert_not_awaited()
+        self.assertIn("5m00s", self.result(it))
+
+        bot.time.time.return_value = self.now + bot.NUDGE_COOLDOWN_SECONDS
+        it = self.make_it()
+        await bot.send_nudge(it, self.target)
+        it.channel.send.assert_awaited_once()
+
+    async def test_failed_send_does_not_start_cooldown(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
+        it = self.make_it()
+        it.channel.send.side_effect = bot.discord.Forbidden(MagicMock(status=403, reason="x"), "no")
+        with self.assertLogs("timerecord", "ERROR"):
+            await bot.send_nudge(it, self.target)
+        self.assertIn("發送失敗", self.result(it))
+        self.assertEqual(bot.bot.nudged_at, {})
+
+    async def test_button_opens_private_member_picker(self):
+        it = make_interaction()
+        await bot.panel_nudge(it)
+        kwargs = it.response.send_message.call_args.kwargs
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertIsInstance(kwargs["view"].children[0], bot.discord.ui.UserSelect)
+
+    async def pick_target(self):
+        view = bot.NudgeView()
+        select = view.children[0]
+        select._values = [self.target]
+        it = self.make_it()
+        await select.callback(it)
+        return it
+
+    async def test_picking_resting_member_asks_which_text(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
+        it = await self.pick_target()
+        kwargs = it.response.edit_message.call_args.kwargs
+        self.assertIsInstance(kwargs["view"], bot.NudgeTextView)
+        it.channel.send.assert_not_awaited()
+
+    async def test_picking_member_not_resting_stops_early(self):
+        it = await self.pick_target()
+        self.assertIn("沒有在休息", self.result(it))
+        self.assertIsNone(it.response.edit_message.call_args.kwargs["view"])
+
+    async def test_default_button_sends_default_text(self):
+        self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
+        view = bot.NudgeTextView(self.target)
+        it = self.make_it()
+        await view.children[0].callback(it)
+        self.assertEqual(it.channel.send.call_args.args[0], f"<@{OTHER}> 你已經休息 10m00s 了！還不讀書嗎")
+        self.assertTrue(view.is_finished())
+
+    async def test_custom_button_opens_prefilled_modal_and_keeps_view_alive(self):
+        view = bot.NudgeTextView(self.target)
+        it = self.make_it()
+        it.response.send_modal = AsyncMock()
+        await view.children[1].callback(it)
+        modal = it.response.send_modal.call_args.args[0]
+        self.assertIsInstance(modal, bot.NudgeTextModal)
+        self.assertEqual(modal.text.default, bot.NUDGE_DEFAULT_TEXT)
+        self.assertFalse(view.is_finished())
+
+    async def submit_modal(self, value):
+        self.db.open_session(G, OTHER, PANEL_CH, "rest", T0, source="button")
+        view = bot.NudgeTextView(self.target)
+        modal = bot.NudgeTextModal(self.target, view)
+        modal.text._value = value
+        it = self.make_it()
+        it.user.mention = f"<@{ME}>"
+        await modal.on_submit(it)
+        self.assertTrue(view.is_finished())
+        return it
+
+    async def test_custom_text_fills_time_and_credits_author(self):
+        it = await self.submit_modal("快回來！{時間} 夠久了 {時間}")
+        args, kwargs = it.channel.send.call_args
+        self.assertEqual(args[0], f"<@{OTHER}> 快回來！10m00s 夠久了 10m00s\n— <@{ME}>")
+        self.assertEqual(kwargs["allowed_mentions"].users, [self.target])  # 只 @ 被催的人
+        self.assertFalse(kwargs["allowed_mentions"].everyone)
+        self.assertFalse(kwargs["allowed_mentions"].roles)
+
+    async def test_custom_text_with_format_braces_is_literal(self):
+        it = await self.submit_modal("{0} {x} 回來")
+        self.assertIn("{0} {x} 回來", it.channel.send.call_args.args[0])
+
+    async def test_blank_custom_text_falls_back_to_default(self):
+        it = await self.submit_modal("   ")
+        self.assertEqual(it.channel.send.call_args.args[0], f"<@{OTHER}> 你已經休息 10m00s 了！還不讀書嗎")
+
+    async def test_rechecks_rest_when_custom_text_is_submitted(self):
+        view = bot.NudgeTextView(self.target)
+        modal = bot.NudgeTextModal(self.target, view)  # 打字期間對方已經離開休息區
+        modal.text._value = "回來"
+        it = self.make_it()
+        await modal.on_submit(it)
+        it.channel.send.assert_not_awaited()
+        self.assertIn("沒有在休息", self.result(it))
 
 
 class VoicePriorityTest(PanelBotTestCase):
@@ -229,6 +382,20 @@ class VoicePriorityTest(PanelBotTestCase):
         await bot.bot.on_voice_state_update(self.member(), self.state(VOICE_CH), self.state(None))
         self.assertEqual(open_rows(self.db), [])
         bot.bot.request_panel_refresh.assert_not_called()
+
+
+class PanelRefreshViewTest(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_updates_buttons_on_existing_panel(self):
+        db = Database(":memory:")
+        db.set_panel(G, PANEL_CH, 1)
+        message = MagicMock()
+        message.edit = AsyncMock()
+        channel = MagicMock()
+        channel.get_partial_message.return_value = message
+        with patch.object(bot.bot, "db", db), patch.object(bot.bot, "get_partial_messageable", return_value=channel):
+            await bot.bot.refresh_panel(G)
+        view = message.edit.call_args.kwargs["view"]
+        self.assertIn("panel:nudge", [b.custom_id for b in view.children])
 
 
 class PanelRefreshThrottleTest(unittest.IsolatedAsyncioTestCase):
