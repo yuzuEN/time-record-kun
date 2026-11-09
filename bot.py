@@ -38,7 +38,7 @@ LOGIN_RETRY_SECONDS = 60
 LOGIN_RETRY_MAX_SECONDS = 30 * 60
 # 同一個人被「催讀書」後，多久內不能再被催，避免有人一直按按鈕洗 @
 NUDGE_COOLDOWN_SECONDS = 5 * 60
-# 催讀書的訊息多久後自動刪除，讓打卡面板不會被訊息推上去
+# 沒有用 /nudge set 指定頻道時，發在面板頻道的催讀書訊息多久後自動刪除，讓打卡面板不會被訊息推上去
 NUDGE_DELETE_AFTER_SECONDS = 60 * 60
 # 催讀書文字裡的這個標記會換成對方已經休息多久
 NUDGE_TIME_PLACEHOLDER = "{時間}"
@@ -686,6 +686,38 @@ async def report_post_cmd(interaction: discord.Interaction, date: str):
 bot.tree.add_command(report_group)
 
 
+nudge_group = app_commands.Group(
+    name="nudge",
+    description="設定打卡面板的「催讀書」訊息要發在哪個頻道",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@nudge_group.command(name="set", description="把催讀書訊息發到指定的文字頻道，避免把打卡面板洗上去")
+@app_commands.describe(channel="要發送催讀書訊息的文字頻道")
+async def nudge_set_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages):
+        await interaction.response.send_message(
+            f"機器人在 {channel.mention} 沒有「檢視頻道」「發送訊息」權限，請先調整頻道權限。", ephemeral=True
+        )
+        return
+    bot.db.set_nudge_channel(interaction.guild_id, channel.id)
+    await interaction.response.send_message(f"✅ 催讀書訊息之後會發在 {channel.mention}", ephemeral=True)
+
+
+@nudge_group.command(name="off", description="取消指定頻道，催讀書訊息改回發在打卡面板的頻道")
+async def nudge_off_cmd(interaction: discord.Interaction):
+    bot.db.set_nudge_channel(interaction.guild_id, None)
+    await interaction.response.send_message(
+        f"✅ 催讀書訊息改回發在打卡面板的頻道，{NUDGE_DELETE_AFTER_SECONDS // 3600} 小時後自動刪除", ephemeral=True
+    )
+
+
+bot.tree.add_command(nudge_group)
+
+
 # ================= 打卡面板 =================
 
 async def panel_enter(interaction: discord.Interaction, category: str):
@@ -763,7 +795,8 @@ def nudge_blocked_reason(guild_id: int, target: Union[discord.Member, discord.Us
 async def send_nudge(
     interaction: discord.Interaction, target: Union[discord.Member, discord.User], custom_text: Optional[str] = None
 ) -> None:
-    """在這個頻道 @ 指定的成員，並把選單改成結果。custom_text 是自訂文字，None 表示用預設文字。"""
+    """@ 指定的成員，並把選單改成結果。custom_text 是自訂文字，None 表示用預設文字。
+    訊息發到 /nudge set 指定的頻道；沒有指定就發在按按鈕的頻道，並在一段時間後自動刪除。"""
     guild_id = interaction.guild_id
     now = int(time.time())
     # 選文字的期間對方可能已經被別人催過，送出前再檢查一次
@@ -771,6 +804,17 @@ async def send_nudge(
     if reason:
         await interaction.response.edit_message(content=reason, view=None)
         return
+
+    channel_id = bot.db.get_nudge_channel(guild_id)
+    if channel_id is None:
+        channel, delete_after, where = interaction.channel, NUDGE_DELETE_AFTER_SECONDS, ""
+    else:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            log.warning("找不到催讀書頻道 %s（伺服器 %s）", channel_id, guild_id)
+            await interaction.response.edit_message(content="找不到催讀書頻道，請管理員用 `/nudge set` 重新設定。", view=None)
+            return
+        delete_after, where = None, f"（在 {channel.mention}）"
 
     default_text, seconds = nudge_status(guild_id, target.id, now)
     elapsed = NUDGE_UNKNOWN_TIME if seconds is None else fmt_duration(seconds)
@@ -782,18 +826,18 @@ async def send_nudge(
     key = (guild_id, target.id)
     bot.nudged_at[key] = now  # 送出前先記下，同時有人按的話只會發一則
     try:
-        await interaction.channel.send(
+        await channel.send(
             content,
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[target]),
-            delete_after=NUDGE_DELETE_AFTER_SECONDS,
+            delete_after=delete_after,
         )
     except discord.HTTPException:
         bot.nudged_at.pop(key, None)
-        log.exception("無法在頻道 %s 發送催讀書訊息", interaction.channel_id)
-        await interaction.response.edit_message(content="訊息發送失敗，請檢查機器人在這個頻道的權限。", view=None)
+        log.exception("無法在頻道 %s 發送催讀書訊息", channel.id)
+        await interaction.response.edit_message(content="訊息發送失敗，請檢查機器人在催讀書頻道的權限。", view=None)
         return
     log.info("%s 催 %s 讀書（伺服器 %s）：%s", interaction.user, target, guild_id, text)
-    await interaction.response.edit_message(content=f"📣 已提醒 **{target.display_name}**。", view=None)
+    await interaction.response.edit_message(content=f"📣 已提醒 **{target.display_name}**{where}。", view=None)
 
 
 class NudgeTextModal(discord.ui.Modal, title="自訂催讀書文字"):

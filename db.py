@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     privacy           TEXT NOT NULL DEFAULT 'public',  -- public：大家都能查大家；private：只有管理員能查別人
     report_channel_id INTEGER,                         -- 每日排行榜公告頻道，NULL 表示關閉
     report_time       INTEGER NOT NULL DEFAULT 0,      -- 每日排行榜公告時間，當地時間午夜後第幾分鐘
-    report_last       TEXT                             -- 最後一次已處理每日排行榜的本地日期（YYYY-MM-DD）
+    report_last       TEXT,                            -- 最後一次已處理每日排行榜的本地日期（YYYY-MM-DD）
+    nudge_channel_id  INTEGER                          -- 催讀書訊息發送的頻道，NULL 表示發在按按鈕的頻道
 );
 
 CREATE TABLE IF NOT EXISTS panels (
@@ -57,6 +58,8 @@ class Database:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(guild_settings)")}
         if "report_time" not in cols:
             self.conn.execute("ALTER TABLE guild_settings ADD COLUMN report_time INTEGER NOT NULL DEFAULT 0")
+        if "nudge_channel_id" not in cols:
+            self.conn.execute("ALTER TABLE guild_settings ADD COLUMN nudge_channel_id INTEGER")
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(sessions)")}
         if "source" not in cols:
             self.conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'voice'")
@@ -250,6 +253,20 @@ class Database:
             "SELECT guild_id, report_channel_id, report_last, report_time FROM guild_settings "
             "WHERE report_channel_id IS NOT NULL"
         ).fetchall()
+
+    def set_nudge_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        """設定（或以 None 取消）催讀書訊息發送的頻道。"""
+        self._exec(
+            "INSERT INTO guild_settings (guild_id, nudge_channel_id) VALUES (?, ?) "
+            "ON CONFLICT (guild_id) DO UPDATE SET nudge_channel_id = excluded.nudge_channel_id",
+            (guild_id, channel_id),
+        )
+
+    def get_nudge_channel(self, guild_id: int) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT nudge_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+        return row["nudge_channel_id"] if row else None
 
     # ---------- 打卡面板 ----------
 

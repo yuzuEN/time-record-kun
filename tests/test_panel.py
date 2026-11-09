@@ -92,6 +92,31 @@ class PanelDbTest(unittest.TestCase):
         self.db.clear_panel(G)
         self.assertIsNone(self.db.get_panel(G))
 
+    def test_nudge_channel_keeps_other_settings(self):
+        self.assertIsNone(self.db.get_nudge_channel(G))
+        self.db.set_privacy(G, "private")
+        self.db.set_nudge_channel(G, 777)
+        self.assertEqual(self.db.get_nudge_channel(G), 777)
+        self.assertEqual(self.db.get_privacy(G), "private")
+        self.db.set_nudge_channel(G, None)
+        self.assertIsNone(self.db.get_nudge_channel(G))
+
+    def test_migrates_guild_settings_without_nudge_channel(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "old.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, privacy TEXT NOT NULL DEFAULT 'public', "
+                "report_channel_id INTEGER, report_time INTEGER NOT NULL DEFAULT 0, report_last TEXT)"
+            )
+            conn.execute("INSERT INTO guild_settings (guild_id, privacy) VALUES (1, 'private')")
+            conn.commit()
+            conn.close()
+            db = Database(path)
+            self.assertIsNone(db.get_nudge_channel(1))
+            self.assertEqual(db.get_privacy(1), "private")
+            db.conn.close()
+
     def test_migrates_sessions_without_source(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "old.db")
@@ -260,6 +285,51 @@ class NudgeTest(PanelBotTestCase):
         self.assertEqual(await self.sent_text(), f"<@{OTHER}> 你現在沒有在計時！還不讀書嗎")
         bot.bot.nudged_at.clear()
         self.assertIn("回來，已經一段時間了", await self.sent_text("回來，已經{時間}了"))
+
+    async def test_configured_channel_gets_message_without_auto_delete(self):
+        self.db.set_nudge_channel(G, 777)
+        chat = MagicMock()
+        chat.send = AsyncMock()
+        chat.mention = "<#777>"
+        it = self.make_it()
+        with patch.object(bot.bot, "get_channel", return_value=chat) as get_channel:
+            await bot.send_nudge(it, self.target)
+        get_channel.assert_called_once_with(777)
+        it.channel.send.assert_not_awaited()  # 面板頻道不會有新訊息
+        self.assertEqual(chat.send.call_args.args[0], f"<@{OTHER}> 你現在沒有在計時！還不讀書嗎")
+        self.assertIsNone(chat.send.call_args.kwargs["delete_after"])
+        self.assertIn("<#777>", self.result(it))
+
+    async def test_missing_configured_channel_does_not_fall_back_to_panel(self):
+        self.db.set_nudge_channel(G, 777)
+        it = self.make_it()
+        with patch.object(bot.bot, "get_channel", return_value=None):
+            await bot.send_nudge(it, self.target)
+        it.channel.send.assert_not_awaited()
+        self.assertIn("/nudge set", self.result(it))
+        self.assertEqual(bot.bot.nudged_at, {})
+
+    async def test_nudge_set_saves_channel(self):
+        channel = MagicMock(id=777, mention="<#777>")
+        it = make_interaction()
+        await bot.nudge_set_cmd.callback(it, channel=channel)
+        self.assertEqual(self.db.get_nudge_channel(G), 777)
+        channel.permissions_for.assert_called_once_with(it.guild.me)
+        self.assertIn("<#777>", reply(it))
+
+    async def test_nudge_set_requires_bot_permissions(self):
+        channel = MagicMock(id=777, mention="<#777>")
+        channel.permissions_for.return_value.send_messages = False
+        it = make_interaction()
+        await bot.nudge_set_cmd.callback(it, channel=channel)
+        self.assertIsNone(self.db.get_nudge_channel(G))
+        self.assertIn("權限", reply(it))
+
+    async def test_nudge_off_clears_channel(self):
+        self.db.set_nudge_channel(G, 777)
+        it = make_interaction()
+        await bot.nudge_off_cmd.callback(it)
+        self.assertIsNone(self.db.get_nudge_channel(G))
 
     async def test_bot_cannot_be_nudged(self):
         self.target.bot = True
